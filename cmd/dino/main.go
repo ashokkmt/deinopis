@@ -497,14 +497,14 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
-		if err := store.RunVaultSealer(ctx, time.Second); err != nil && ctx.Err() == nil {
-			fmt.Fprintf(os.Stderr, "ERROR: vault window sealer stopped: %v\n", err)
+		if err := store.RunVaultBatchSealer(ctx, time.Second); err != nil && ctx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "ERROR: vault batch sealer stopped: %v\n", err)
 		}
 	}()
 	if vaultClient != nil {
 		go func() {
-			if err := store.RunVaultUploader(ctx, vaultClient, time.Second); err != nil && ctx.Err() == nil {
-				fmt.Fprintf(os.Stderr, "ERROR: vault uploader stopped: %v\n", err)
+			if err := store.RunVaultBatchUploader(ctx, vaultClient, time.Second); err != nil && ctx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "ERROR: vault batch uploader stopped: %v\n", err)
 			}
 		}()
 		go runVaultHeartbeats(ctx, store, vaultClient, streamID)
@@ -762,7 +762,7 @@ func stripCommandOptions(args []string, stripJSON bool) []string {
 }
 
 func configureVaultWitness(store *rawstore.RawStore) (*witness.Client, string, error) {
-	keys := []string{"DEINOPIS_VAULT_STREAM_ID", "DEINOPIS_VAULT_EPOCH", "DEINOPIS_WITNESS_URL", "DEINOPIS_WITNESS_TOKEN", "DEINOPIS_WITNESS_CA", "DEINOPIS_WITNESS_CLIENT_CERT", "DEINOPIS_WITNESS_CLIENT_KEY"}
+	keys := []string{"DEINOPIS_VAULT_STREAM_ID", "DEINOPIS_WITNESS_URL", "DEINOPIS_WITNESS_TOKEN", "DEINOPIS_WITNESS_CA", "DEINOPIS_WITNESS_CLIENT_CERT", "DEINOPIS_WITNESS_CLIENT_KEY"}
 	values := make(map[string]string, len(keys))
 	configured := 0
 	for _, key := range keys {
@@ -775,12 +775,9 @@ func configureVaultWitness(store *rawstore.RawStore) (*witness.Client, string, e
 		return nil, "", nil
 	}
 	if configured != len(keys) {
-		return nil, "", fmt.Errorf("vault witness requires all seven DEINOPIS_VAULT_* and DEINOPIS_WITNESS_* settings")
+		return nil, "", fmt.Errorf("v2 vault witness requires DEINOPIS_VAULT_STREAM_ID and all DEINOPIS_WITNESS_* settings")
 	}
-	epoch, err := time.Parse(time.RFC3339, values["DEINOPIS_VAULT_EPOCH"])
-	if err != nil {
-		return nil, "", fmt.Errorf("invalid DEINOPIS_VAULT_EPOCH: %w", err)
-	}
+	var err error
 	if _, err = hex.DecodeString(values["DEINOPIS_VAULT_STREAM_ID"]); err != nil || len(values["DEINOPIS_VAULT_STREAM_ID"]) != 64 || strings.ToLower(values["DEINOPIS_VAULT_STREAM_ID"]) != values["DEINOPIS_VAULT_STREAM_ID"] {
 		return nil, "", errors.New("DEINOPIS_VAULT_STREAM_ID must be 64 lowercase hexadecimal characters")
 	}
@@ -800,13 +797,13 @@ func configureVaultWitness(store *rawstore.RawStore) (*witness.Client, string, e
 	if err != nil {
 		return nil, "", err
 	}
-	state, err := store.VaultState(context.Background())
+	state, err := store.VaultBatchState(context.Background())
 	if err != nil {
 		return nil, "", err
 	}
-	if state.StreamID != values["DEINOPIS_VAULT_STREAM_ID"] || !state.EpochStart.Equal(epoch.UTC()) {
-		if err = store.ConfigureVaultStream(context.Background(), values["DEINOPIS_VAULT_STREAM_ID"], epoch.UTC()); err != nil {
-			return nil, "", fmt.Errorf("configure enrolled stream (existing evidence is never rewritten): %w", err)
+	if state.StreamID != values["DEINOPIS_VAULT_STREAM_ID"] {
+		if err = store.ConfigureVaultBatchStream(context.Background(), values["DEINOPIS_VAULT_STREAM_ID"]); err != nil {
+			return nil, "", fmt.Errorf("configure enrolled v2 stream (existing evidence is never rewritten): %w", err)
 		}
 	}
 	return client, values["DEINOPIS_VAULT_STREAM_ID"], nil

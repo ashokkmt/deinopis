@@ -80,6 +80,14 @@ dino replay all
 
 Pack validation and testing do not activate YAML. `apply` normally uses the running management API; `--local --packs-dir <dir>` is for a stopped installation with no active directory owner. Local changes load at the next startup. Do not use local mode to bypass a failed authenticated live operation.
 
+## Witness operator status
+
+On the witness host, `dino-witness -status` prints preserved publication history and pending queue state as JSON, then exits. Use `-db <path>` and `-manifest-dir <path>` to inspect a non-default witness store. The status distinguishes pending, submitted, included, finalized, blocked, and conflict states; a pending or included batch is not finalized evidence. Queue status is read-only; this runtime does not send transactions.
+
+The witness rejects retired `DEINOPIS_CHAIN_*`, `DEINOPIS_REGISTRY_*`, and `DEINOPIS_PUBLISHER_KEY_FILE` settings before opening its database. Existing publication jobs, attempts, signed bytes, and receipts remain stored for operator review; they are never replayed to a simulator.
+
+For an explicit local contract smoke run, start `dino-sim`. It creates a fresh temporary run directory, starts Anvil on loopback with a random local chain ID, deploys the registry, verifies its empty history, and prints the run metadata. Press Ctrl-C to stop only that Anvil child process. Artifacts remain in the printed run directory. This is **SIMULATED** local behavior, not production publication, independent custody, or public-chain finality.
+
 ## Security and operations
 
 Management, HTTP ingestion, and plaintext Syslog defaults bind to loopback. Configure intake and management authentication before exposing listeners. Store credentials in private environment variables or secret files, not in checked-in YAML or command history. Source and sink adapters keep their own configured network behavior; parser provisioning does not disable them.

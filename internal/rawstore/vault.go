@@ -1,9 +1,11 @@
 package rawstore
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,10 +20,14 @@ import (
 )
 
 const (
-	vaultWindowSeconds = int64(300)
-	maxWindowMembers   = 100_000
-	maxWindowBytes     = 64 * 1024 * 1024
-	maxSealCatchup     = 10_000
+	vaultWindowSeconds       = int64(300)
+	maxWindowMembers         = 100_000
+	maxWindowBytes           = 64 * 1024 * 1024
+	maxSealCatchup           = 10_000
+	maxPendingUploads        = 1_000
+	maxPendingBytes          = 1 << 30
+	maxPendingAge            = 24 * time.Hour
+	vaultManifestHeaderBytes = int64(len("DEINOPIS-MANIFEST-V1") + 2 + 32 + 8 + 8 + 8 + 1 + 8 + 32 + 32)
 )
 
 type VaultState struct {
@@ -76,7 +82,9 @@ func (s *RawStore) VaultState(ctx context.Context) (VaultState, error) {
 
 func (s *RawStore) PendingVaultUploads(ctx context.Context) (uint32, error) {
 	var pending uint64
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM vault_uploads WHERE state='pending'`).Scan(&pending)
+	err := s.db.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM vault_uploads WHERE state IN ('pending','blocked')) +
+		(SELECT pending_upload_count FROM vault_batch_streams WHERE id=1)`).Scan(&pending)
 	if err != nil {
 		return 0, err
 	}
@@ -129,9 +137,7 @@ func (s *RawStore) sealDueWindowsTx(ctx context.Context, tx *sql.Tx, now time.Ti
 func (s *RawStore) sealDueWindowsObservedTx(ctx context.Context, tx *sql.Tx, now, observedFrom time.Time, clockHealthy bool) error {
 	var streamID string
 	var epoch, windowSeconds, lastSealed int64
-	var nextSeq uint64
-	var previousBytes []byte
-	if err := tx.QueryRowContext(ctx, `SELECT stream_id,epoch_start,window_seconds,last_sealed_slot,next_sequence,last_commitment FROM vault_streams WHERE id=1`).Scan(&streamID, &epoch, &windowSeconds, &lastSealed, &nextSeq, &previousBytes); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT stream_id,epoch_start,window_seconds,last_sealed_slot FROM vault_streams WHERE id=1`).Scan(&streamID, &epoch, &windowSeconds, &lastSealed); err != nil {
 		return err
 	}
 	if windowSeconds != vaultWindowSeconds {
@@ -148,24 +154,24 @@ func (s *RawStore) sealDueWindowsObservedTx(ctx context.Context, tx *sql.Tx, now
 	if closedThrough-lastSealed > maxSealCatchup {
 		return fmt.Errorf("vault has %d overdue windows; operator recovery required", closedThrough-lastSealed)
 	}
-	var stream integrity.Digest
-	decoded, err := hex.DecodeString(streamID)
-	if err != nil || len(decoded) != len(stream) {
-		return errors.New("stored vault stream ID is invalid")
-	}
-	copy(stream[:], decoded)
-	var previous integrity.Digest
-	if len(previousBytes) != len(previous) {
-		return errors.New("stored predecessor commitment is invalid")
-	}
-	copy(previous[:], previousBytes)
 	for slot := lastSealed + 1; slot <= closedThrough; slot++ {
-		entries, err := readWindowEntries(ctx, tx, streamID, uint64(slot))
-		if err != nil {
+		var exists int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM vault_seal_tasks WHERE stream_id=? AND slot=?`, streamID, slot).Scan(&exists); err != nil {
+			return err
+		}
+		if exists != 0 {
+			continue
+		}
+		var count int64
+		var bytes int64
+		var highWater int64
+		if err := tx.QueryRowContext(ctx, `SELECT member_count,encoded_bytes,high_water_sequence FROM vault_slot_state WHERE stream_id=? AND slot=?`, streamID, slot).Scan(&count, &bytes, &highWater); errors.Is(err, sql.ErrNoRows) {
+			count, bytes, highWater = 0, 0, 0
+		} else if err != nil {
 			return err
 		}
 		coverage := integrity.CoverageInterrupted
-		if len(entries) == 0 {
+		if count == 0 {
 			coverage = integrity.CoverageGap
 		}
 		start := uint64(epoch + slot*windowSeconds)
@@ -174,50 +180,31 @@ func (s *RawStore) sealDueWindowsObservedTx(ctx context.Context, tx *sql.Tx, now
 		} else if !observedFrom.IsZero() && observedFrom.Unix() < int64(start+uint64(windowSeconds)) {
 			coverage = integrity.CoverageInterrupted
 		}
-		manifest := integrity.Manifest{StreamID: stream, Slot: uint64(slot), Start: start, End: start + uint64(windowSeconds), Coverage: coverage, Previous: previous, Entries: entries}
-		manifestBytes, err := integrity.EncodeManifest(manifest)
-		if err != nil {
-			return fmt.Errorf("encode vault window %d: %w", slot, err)
-		}
-		commitment, err := integrity.WindowCommitment(manifest, manifestBytes)
-		if err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO vault_slot_state(stream_id,slot,member_count,encoded_bytes,high_water_sequence,closed,closed_at_ns)
+			VALUES(?,?,?,?,?,1,?) ON CONFLICT(stream_id,slot) DO UPDATE SET closed=1,closed_at_ns=excluded.closed_at_ns`, streamID, slot, count, bytes, highWater, now.UTC().UnixNano()); err != nil {
 			return err
 		}
-		root, err := integrity.MerkleRootEntries(entries)
-		if err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO vault_seal_tasks(stream_id,slot,coverage,member_count,encoded_bytes,high_water_sequence,closed_at_ns) VALUES(?,?,?,?,?,?,?)`, streamID, slot, int(coverage), count, bytes, highWater, now.UTC().UnixNano()); err != nil {
 			return err
 		}
-		digest := integrity.ManifestDigest(manifestBytes)
-		highWater := uint64(0)
-		if len(entries) != 0 {
-			highWater = entries[len(entries)-1].AcceptSeq
-		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO vault_windows(stream_id,slot,coverage,entry_count,high_water_sequence,manifest,manifest_digest,merkle_root,previous_commitment,commitment,sealed_at_ns)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?)`, streamID, slot, int(coverage), len(entries), highWater, manifestBytes, digest[:], root[:], previous[:], commitment[:], now.UTC().UnixNano()); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE vault_streams SET pending_upload_count=pending_upload_count+1,pending_upload_bytes=pending_upload_bytes+? WHERE id=1`, bytes+vaultManifestHeaderBytes); err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO vault_uploads(stream_id,slot,state,retry_at_ns) VALUES(?,?,'pending',?)`, streamID, slot, now.UTC().UnixNano()); err != nil {
-			return err
-		}
-		if _, err = tx.ExecContext(ctx, `UPDATE vault_streams SET last_sealed_slot=?,last_commitment=? WHERE id=1`, slot, commitment[:]); err != nil {
-			return err
-		}
-		previous = commitment
 	}
 	return nil
 }
 
-func readWindowEntries(ctx context.Context, tx *sql.Tx, streamID string, slot uint64) ([]integrity.Entry, error) {
+func streamWindowEntries(ctx context.Context, tx *sql.Tx, streamID string, slot uint64, consume func(integrity.Entry, []byte) error) (uint64, uint64, uint64, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT m.accept_seq,m.accepted_at_ns,r.raw_id,r.received_at,r.transport,r.source_ip,r.source_port,r.metadata_json,r.payload
 		FROM vault_members m JOIN raw_events r USING(raw_id) WHERE m.stream_id=? AND m.slot=? ORDER BY m.accept_seq`, streamID, slot)
 	if err != nil {
-		return nil, err
+		return 0, 0, 0, err
 	}
 	defer rows.Close()
 	streamBytes, _ := hex.DecodeString(streamID)
 	var stream integrity.Digest
 	copy(stream[:], streamBytes)
-	entries := make([]integrity.Entry, 0)
+	var count, encodedBytes, highWater uint64
 	for rows.Next() {
 		var seq uint64
 		var accepted int64
@@ -225,38 +212,190 @@ func readWindowEntries(ctx context.Context, tx *sql.Tx, streamID string, slot ui
 		var sourcePort int
 		var payload []byte
 		if err := rows.Scan(&seq, &accepted, &rawID, &received, &transport, &sourceIP, &sourcePort, &metadataJSON, &payload); err != nil {
-			return nil, err
+			return 0, 0, 0, err
+		}
+		if seq == 0 || (count > 0 && (highWater == math.MaxUint64 || seq != highWater+1)) {
+			return 0, 0, 0, errors.New("vault membership sequence is not contiguous")
 		}
 		receivedAt, err := time.Parse(time.RFC3339Nano, received)
 		if err != nil {
-			return nil, fmt.Errorf("invalid raw receive time for %s: %w", rawID, err)
+			return 0, 0, 0, fmt.Errorf("invalid raw receive time for %s: %w", rawID, err)
 		}
 		if sourcePort < 0 || sourcePort > math.MaxUint16 {
-			return nil, fmt.Errorf("invalid source port for %s", rawID)
+			return 0, 0, 0, fmt.Errorf("invalid source port for %s", rawID)
 		}
 		var metadata model.ReceiveMetadata
 		if err = json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
-			return nil, err
+			return 0, 0, 0, err
 		}
-		entries = append(entries, integrity.Entry{StreamID: stream, Slot: slot, AcceptSeq: seq, AcceptedAt: accepted, RawID: rawID, ReceivedAt: receivedAt.UnixNano(), Transport: transport, SourceIP: sourceIP, SourcePort: uint16(sourcePort), Metadata: metadata, Payload: payload})
+		entry := integrity.Entry{StreamID: stream, Slot: slot, AcceptSeq: seq, AcceptedAt: accepted, RawID: rawID, ReceivedAt: receivedAt.UnixNano(), Transport: transport, SourceIP: sourceIP, SourcePort: uint16(sourcePort), Metadata: metadata, Payload: payload}
+		encoded, err := integrity.EncodeEntry(entry)
+		if err != nil {
+			return 0, 0, 0, fmt.Errorf("encode raw parent %s: %w", rawID, err)
+		}
+		if err = consume(entry, encoded); err != nil {
+			return 0, 0, 0, err
+		}
+		count++
+		encodedBytes += uint64(len(encoded) + 4)
+		highWater = seq
 	}
-	return entries, rows.Err()
+	if err = rows.Err(); err != nil {
+		return 0, 0, 0, err
+	}
+	return count, encodedBytes, highWater, nil
+}
+
+// processNextVaultSeal builds one manifest outside the writer transaction from
+// a durably closed slot, then atomically publishes the window and upload intent.
+func (s *RawStore) processNextVaultSeal(ctx context.Context, now time.Time) (bool, error) {
+	s.sealMu.Lock()
+	defer s.sealMu.Unlock()
+	var streamID string
+	var slot uint64
+	var coverage int
+	var expectedCount, expectedBytes, highWater uint64
+	err := s.db.QueryRowContext(ctx, `SELECT stream_id,slot,coverage,member_count,encoded_bytes,high_water_sequence
+		FROM vault_seal_tasks ORDER BY slot LIMIT 1`).Scan(&streamID, &slot, &coverage, &expectedCount, &expectedBytes, &highWater)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var lastSealed int64
+	var previousBytes []byte
+	if err = s.db.QueryRowContext(ctx, `SELECT last_sealed_slot,last_commitment FROM vault_streams WHERE id=1`).Scan(&lastSealed, &previousBytes); err != nil {
+		return false, err
+	}
+	if int64(slot) != lastSealed+1 || len(previousBytes) != 32 {
+		return false, fmt.Errorf("vault seal task %d is out of predecessor order", slot)
+	}
+	var previous integrity.Digest
+	copy(previous[:], previousBytes)
+	var stream integrity.Digest
+	streamBytes, err := hex.DecodeString(streamID)
+	if err != nil || len(streamBytes) != 32 {
+		return false, errors.New("stored vault stream ID is invalid")
+	}
+	copy(stream[:], streamBytes)
+	var accumulator integrity.MerkleAccumulator
+	var body bytes.Buffer
+	if expectedBytes > maxWindowBytes {
+		return false, errors.New("vault encoded-byte counter exceeds the manifest limit")
+	}
+	body.Grow(int(expectedBytes))
+	readTx, err := s.readerDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return false, err
+	}
+	count, actualBytes, actualHigh, scanErr := streamWindowEntries(ctx, readTx, streamID, slot, func(entry integrity.Entry, encoded []byte) error {
+		if body.Len()+len(encoded)+4+len("DEINOPIS-MANIFEST-V1")+2+32+8*3+1+8+64 > maxWindowBytes {
+			return errors.New("vault manifest exceeds 64 MiB")
+		}
+		if encodeErr := accumulator.AddEntry(encoded); encodeErr != nil {
+			return encodeErr
+		}
+		var size [4]byte
+		binary.BigEndian.PutUint32(size[:], uint32(len(encoded)))
+		body.Write(size[:])
+		body.Write(encoded)
+		return nil
+	})
+	if scanErr != nil {
+		_ = readTx.Rollback()
+		return false, scanErr
+	}
+	if err = readTx.Commit(); err != nil {
+		return false, err
+	}
+	if count != expectedCount || actualBytes != expectedBytes || actualHigh != highWater {
+		return false, fmt.Errorf("closed vault slot %d encoded-byte counter mismatch", slot)
+	}
+	root := accumulator.Root()
+	var epoch int64
+	if err = s.db.QueryRowContext(ctx, `SELECT epoch_start FROM vault_streams WHERE id=1`).Scan(&epoch); err != nil {
+		return false, err
+	}
+	start := uint64(epoch) + slot*uint64(vaultWindowSeconds)
+	prefix, err := integrity.ManifestPrefix(stream, slot, start, start+uint64(vaultWindowSeconds), integrity.Coverage(coverage), expectedCount, previous, root)
+	if err != nil {
+		return false, err
+	}
+	manifest := append(prefix, body.Bytes()...)
+	if len(manifest) > maxWindowBytes {
+		return false, errors.New("vault manifest exceeds 64 MiB")
+	}
+	digest := integrity.ManifestDigest(manifest)
+	commitment, err := integrity.WindowCommitmentFields(stream, slot, start, start+uint64(vaultWindowSeconds), integrity.Coverage(coverage), expectedCount, previous, root, digest)
+	if err != nil {
+		return false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var currentCount, currentBytes, currentHigh uint64
+	if err = tx.QueryRowContext(ctx, `SELECT member_count,encoded_bytes,high_water_sequence FROM vault_slot_state WHERE stream_id=? AND slot=? AND closed=1`, streamID, slot).Scan(&currentCount, &currentBytes, &currentHigh); err != nil {
+		return false, err
+	}
+	if currentCount != expectedCount || currentBytes != expectedBytes || currentHigh != highWater {
+		return false, fmt.Errorf("closed vault slot %d counter mismatch", slot)
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO vault_windows(stream_id,slot,coverage,entry_count,high_water_sequence,manifest,manifest_digest,merkle_root,previous_commitment,commitment,sealed_at_ns)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, streamID, slot, coverage, expectedCount, highWater, manifest, digest[:], root[:], previous[:], commitment[:], now.UTC().UnixNano()); err != nil {
+		return false, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO vault_uploads(stream_id,slot,state,retry_at_ns) VALUES(?,?,'pending',?)`, streamID, slot, now.UTC().UnixNano()); err != nil {
+		return false, err
+	}
+	updated, updateErr := tx.ExecContext(ctx, `UPDATE vault_streams SET last_sealed_slot=?,last_commitment=? WHERE id=1 AND last_sealed_slot=?`, slot, commitment[:], lastSealed)
+	if updateErr != nil {
+		return false, updateErr
+	}
+	changed, updateErr := updated.RowsAffected()
+	if updateErr != nil || changed != 1 {
+		return false, errors.New("vault predecessor changed before seal finalization")
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM vault_seal_tasks WHERE stream_id=? AND slot=?`, streamID, slot); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *RawStore) processVaultSealTasks(ctx context.Context, now time.Time) error {
+	for {
+		worked, err := s.processNextVaultSeal(ctx, now)
+		if err != nil || !worked {
+			return err
+		}
+	}
 }
 
 // SealDueWindows closes elapsed slots. Empty slots are recorded as gaps; nonempty
 // slots stay interrupted until continuity monitoring can prove full coverage.
 func (s *RawStore) SealDueWindows(ctx context.Context, now time.Time) error {
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		s.writeMu.Unlock()
 		return err
 	}
-	defer tx.Rollback()
 	if err = s.sealDueWindowsTx(ctx, tx, now.UTC()); err != nil {
+		_ = tx.Rollback()
+		s.writeMu.Unlock()
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		s.writeMu.Unlock()
+		return err
+	}
+	s.writeMu.Unlock()
+	return s.processVaultSealTasks(ctx, now.UTC())
 }
 
 func (s *RawStore) RunVaultSealer(ctx context.Context, interval time.Duration) error {
@@ -287,6 +426,11 @@ func (s *RawStore) RunVaultSealer(ctx context.Context, interval time.Duration) e
 		}
 		if err != nil && ctx.Err() == nil {
 			return err
+		}
+		if err == nil {
+			if err = s.processVaultSealTasks(ctx, now.UTC()); err != nil && ctx.Err() == nil {
+				return err
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -334,12 +478,17 @@ func (s *RawStore) ProcessNextVaultUpload(ctx context.Context, uploader Manifest
 	var streamID string
 	var slot uint64
 	var attempts uint
-	err := s.db.QueryRowContext(ctx, `SELECT u.stream_id,u.slot,u.attempts FROM vault_uploads u WHERE u.state='pending' AND u.retry_at_ns<=? ORDER BY u.slot LIMIT 1`, now.UTC().UnixNano()).Scan(&streamID, &slot, &attempts)
+	var retryAt int64
+	var state string
+	err := s.db.QueryRowContext(ctx, `SELECT u.stream_id,u.slot,u.attempts,u.retry_at_ns,u.state FROM vault_uploads u WHERE u.state IN ('pending','blocked') ORDER BY u.slot LIMIT 1`).Scan(&streamID, &slot, &attempts, &retryAt, &state)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
+	}
+	if state == "blocked" || retryAt > now.UTC().UnixNano() {
+		return false, nil
 	}
 	var manifest []byte
 	var digestBytes []byte
@@ -357,8 +506,37 @@ func (s *RawStore) ProcessNextVaultUpload(ctx context.Context, uploader Manifest
 		uploadErr = errors.New("witness returned an empty receipt")
 	}
 	if uploadErr == nil {
-		_, err = s.db.ExecContext(ctx, `UPDATE vault_uploads SET state='uploaded',attempts=?,last_error=NULL,witness_receipt=? WHERE stream_id=? AND slot=? AND state='pending'`, attempts, receipt, streamID, slot)
-		return true, err
+		tx, beginErr := s.db.BeginTx(ctx, nil)
+		if beginErr != nil {
+			return true, beginErr
+		}
+		defer tx.Rollback()
+		updated, updateErr := tx.ExecContext(ctx, `UPDATE vault_uploads SET state='uploaded',attempts=?,last_error=NULL,witness_receipt=? WHERE stream_id=? AND slot=? AND state='pending'`, attempts, receipt, streamID, slot)
+		if updateErr != nil {
+			return true, updateErr
+		}
+		changed, updateErr := updated.RowsAffected()
+		if updateErr != nil {
+			return true, updateErr
+		}
+		if changed == 1 {
+			budget, budgetErr := tx.ExecContext(ctx, `UPDATE vault_streams SET pending_upload_count=pending_upload_count-1,
+				pending_upload_bytes=pending_upload_bytes-(SELECT length(manifest) FROM vault_windows WHERE stream_id=? AND slot=?) WHERE id=1 AND pending_upload_count>0
+				AND pending_upload_bytes >= (SELECT length(manifest) FROM vault_windows WHERE stream_id=? AND slot=?)`, streamID, slot, streamID, slot)
+			if budgetErr != nil {
+				return true, budgetErr
+			}
+			budgetRows, budgetErr := budget.RowsAffected()
+			if budgetErr != nil || budgetRows != 1 {
+				return true, errors.New("vault upload backlog counters are inconsistent")
+			}
+		}
+		return true, tx.Commit()
+	}
+	var permanent interface{ Permanent() bool }
+	if errors.As(uploadErr, &permanent) && permanent.Permanent() {
+		_, err = s.db.ExecContext(ctx, `UPDATE vault_uploads SET state='blocked',attempts=?,last_error='permanent witness rejection' WHERE stream_id=? AND slot=? AND state='pending'`, attempts, streamID, slot)
+		return true, errOr(err, uploadErr)
 	}
 	delay := time.Second
 	shift := attempts - 1
@@ -376,6 +554,13 @@ func (s *RawStore) ProcessNextVaultUpload(ctx context.Context, uploader Manifest
 		return true, err
 	}
 	return true, uploadErr
+}
+
+func errOr(updateErr, cause error) error {
+	if updateErr != nil {
+		return updateErr
+	}
+	return cause
 }
 
 func (s *RawStore) RunVaultUploader(ctx context.Context, uploader ManifestUploader, interval time.Duration) error {

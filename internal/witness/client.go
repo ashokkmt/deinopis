@@ -24,6 +24,15 @@ type Client struct {
 	token string
 }
 
+type HTTPStatusError struct{ StatusCode int }
+
+func (e HTTPStatusError) Error() string {
+	return fmt.Sprintf("witness rejected request with HTTP %d", e.StatusCode)
+}
+func (e HTTPStatusError) Permanent() bool {
+	return e.StatusCode < 500 && e.StatusCode != http.StatusRequestTimeout && e.StatusCode != http.StatusTooManyRequests
+}
+
 func (c *Client) SendHeartbeat(ctx context.Context, streamID, bootID string, counter uint64, queueDepth uint32) error {
 	if !validDigestText(streamID) || bootID == "" || len(bootID) > 128 {
 		return errors.New("invalid witness heartbeat identity")
@@ -87,7 +96,7 @@ func (c *Client) UploadManifest(ctx context.Context, streamID string, slot uint6
 		return "", errors.New("invalid witness response")
 	}
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("witness rejected upload with HTTP %d", resp.StatusCode)
+		return "", HTTPStatusError{StatusCode: resp.StatusCode}
 	}
 	var receipt struct {
 		StreamID       string `json:"stream_id"`
@@ -105,11 +114,72 @@ func (c *Client) UploadManifest(ctx context.Context, streamID string, slot uint6
 	if decoder.Decode(new(any)) != io.EOF {
 		return "", errors.New("invalid witness receipt")
 	}
-	if receipt.StreamID != streamID || receipt.Slot != fmt.Sprint(slot) || receipt.ManifestDigest != hex.EncodeToString(digest[:]) || !validDigestText(receipt.Commitment) {
+	parsed, err := integrity.ParseManifest(body)
+	if err != nil {
+		return "", errors.New("queued witness manifest is invalid")
+	}
+	if receipt.StreamID != streamID || receipt.Slot != fmt.Sprint(slot) || receipt.ManifestDigest != hex.EncodeToString(digest[:]) || receipt.Commitment != hex.EncodeToString(parsed.Commitment[:]) {
 		return "", errors.New("witness receipt does not match upload")
 	}
 	if _, err = time.Parse(time.RFC3339Nano, receipt.ReceivedAt); err != nil {
 		return "", errors.New("witness receipt has invalid timestamp")
+	}
+	encoded, err := json.Marshal(receipt)
+	return string(encoded), err
+}
+
+func (c *Client) UploadBatch(ctx context.Context, streamID string, batchNo uint64, digest integrity.Digest, body []byte) (string, error) {
+	if len(body) == 0 || len(body) > 64*1024*1024 || !validDigestText(streamID) || integrity.ManifestDigest(body) != digest {
+		return "", errors.New("invalid batch upload payload")
+	}
+	parsed, err := integrity.ParseBatchManifest(body)
+	if err != nil || hex.EncodeToString(parsed.StreamID[:]) != streamID || parsed.BatchNo != batchNo {
+		return "", errors.New("queued batch manifest identity is invalid")
+	}
+	u := *c.base
+	u.Path = c.base.Path + fmt.Sprintf("/internal/v2/streams/%s/batches/%d", streamID, batchNo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-DEINOPIS-Manifest-SHA256", hex.EncodeToString(digest[:]))
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", errors.New("witness batch upload request failed")
+	}
+	defer resp.Body.Close()
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if err != nil || len(payload) > 1<<20 {
+		return "", errors.New("invalid witness batch response")
+	}
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return "", HTTPStatusError{StatusCode: resp.StatusCode}
+	}
+	var receipt struct {
+		StreamID       string `json:"stream_id"`
+		BatchNo        string `json:"batch_no"`
+		FirstSequence  string `json:"first_sequence"`
+		LastSequence   string `json:"last_sequence"`
+		Count          string `json:"count"`
+		ManifestDigest string `json:"manifest_digest"`
+		Commitment     string `json:"commitment"`
+		ReceivedAt     string `json:"received_at"`
+		Existing       bool   `json:"existing"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err = decoder.Decode(&receipt); err != nil || decoder.Decode(new(any)) != io.EOF {
+		return "", errors.New("invalid witness batch receipt")
+	}
+	if receipt.StreamID != streamID || receipt.BatchNo != fmt.Sprint(batchNo) || receipt.FirstSequence != fmt.Sprint(parsed.FirstSequence) ||
+		receipt.LastSequence != fmt.Sprint(parsed.LastSequence) || receipt.Count != fmt.Sprint(parsed.Count) ||
+		receipt.ManifestDigest != hex.EncodeToString(digest[:]) || receipt.Commitment != hex.EncodeToString(parsed.Commitment[:]) {
+		return "", errors.New("witness receipt does not match uploaded batch")
+	}
+	if _, err = time.Parse(time.RFC3339Nano, receipt.ReceivedAt); err != nil {
+		return "", errors.New("witness batch receipt has invalid timestamp")
 	}
 	encoded, err := json.Marshal(receipt)
 	return string(encoded), err

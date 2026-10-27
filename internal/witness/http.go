@@ -21,8 +21,65 @@ func ServerTLSConfig(clientCAs *x509.CertPool) *tls.Config {
 func NewHandler(store *Store) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /internal/v1/streams/{stream}/windows/{slot}", store.putManifest)
+	mux.HandleFunc("PUT /internal/v2/streams/{stream}/batches/{batch}", store.putBatch)
 	mux.HandleFunc("POST /internal/v1/streams/{stream}/heartbeat", store.postHeartbeat)
 	return mux
+}
+
+func (s *Store) putBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Content-Type") != "application/octet-stream" {
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported media type")
+		return
+	}
+	identity, token, ok := requestIdentity(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "mTLS identity and bearer token required")
+		return
+	}
+	batchNo, err := parseUint(r.PathValue("batch"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid batch number")
+		return
+	}
+	streamID := r.PathValue("stream")
+	if err = s.AuthorizeBatch(r.Context(), streamID, identity, token); err != nil {
+		writeError(w, http.StatusUnauthorized, "collector is not authorized for this stream")
+		return
+	}
+	body, err := readBounded(r.Body, manifestLimit)
+	if err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, "manifest too large")
+		return
+	}
+	receipt, err := s.AcceptBatch(r.Context(), streamID, batchNo, r.Header.Get("X-DEINOPIS-Manifest-SHA256"), identity, token, body, time.Now().UTC())
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrUnauthorized), errors.Is(err, ErrNotEnrolled):
+			writeError(w, http.StatusUnauthorized, "collector is not authorized for this stream")
+		case errors.Is(err, ErrConflict):
+			writeError(w, http.StatusConflict, "original batch manifest conflict recorded")
+		case strings.Contains(err.Error(), "quota exhausted"):
+			writeError(w, http.StatusInsufficientStorage, "witness storage quota exhausted")
+		case strings.Contains(err.Error(), "disk watermark"):
+			writeError(w, http.StatusInsufficientStorage, "witness disk watermark reached")
+		default:
+			writeError(w, http.StatusUnprocessableEntity, "batch manifest rejected")
+		}
+		return
+	}
+	status := http.StatusCreated
+	if receipt.Existing {
+		status = http.StatusOK
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"stream_id": receipt.StreamID, "batch_no": fmt.Sprint(receipt.BatchNo),
+		"first_sequence": fmt.Sprint(receipt.FirstSequence), "last_sequence": fmt.Sprint(receipt.LastSequence),
+		"count": fmt.Sprint(receipt.Count), "manifest_digest": hex.EncodeToString(receipt.Digest[:]),
+		"commitment": hex.EncodeToString(receipt.Commitment[:]), "received_at": receipt.ReceivedAt.Format(time.RFC3339Nano),
+		"existing": receipt.Existing,
+	})
 }
 
 func (s *Store) putManifest(w http.ResponseWriter, r *http.Request) {
@@ -38,6 +95,10 @@ func (s *Store) putManifest(w http.ResponseWriter, r *http.Request) {
 	slot, err := parseUint(r.PathValue("slot"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid slot")
+		return
+	}
+	if err = s.AuthorizeManifest(r.Context(), r.PathValue("stream"), identity, token); err != nil {
+		writeError(w, http.StatusUnauthorized, "collector is not authorized for this stream")
 		return
 	}
 	body, err := readBounded(r.Body, manifestLimit)

@@ -12,6 +12,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -112,14 +114,196 @@ func TestManifestIntakeRequiresMTLSAndIsFirstWrite(t *testing.T) {
 	if len(files) != 1 {
 		t.Fatalf("stored manifests=%d", len(files))
 	}
-	clientCAPool.AddCert(server.Certificate())
-	collector, err := NewClient(server.URL, token, tls.Certificate{Certificate: [][]byte{clientCert.Raw}, PrivateKey: clientKey, Leaf: clientCert}, clientCAPool)
+	serverRoots := x509.NewCertPool()
+	serverRoots.AddCert(server.Certificate())
+	collector, err := NewClient(server.URL, token, tls.Certificate{Certificate: [][]byte{clientCert.Raw}, PrivateKey: clientKey, Leaf: clientCert}, serverRoots)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err = collector.SendHeartbeat(ctx, streamText, "boot-1", 1, 0); err != nil {
 		t.Fatalf("mTLS heartbeat failed: %v", err)
 	}
+}
+
+func TestCountBatchIntakeIsOrderedImmutableAndQueuesPublication(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(filepath.Join(dir, "witness.db"), filepath.Join(dir, "manifests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	stream := integrity.Digest{11, 22}
+	streamID := hex.EncodeToString(stream[:])
+	fingerprintDigest := integrity.Digest{33, 44}
+	fingerprint := hex.EncodeToString(fingerprintDigest[:])
+	token := "synthetic-token"
+	ctx := context.Background()
+	if err = store.EnrollBatch(ctx, streamID, fingerprint, token); err != nil {
+		t.Fatal(err)
+	}
+	firstBody := makeWitnessBatch(t, stream, 0, 1, 1, integrity.Digest{}, "normal")
+	firstDigest := manifestDigestText(firstBody)
+	first, err := store.AcceptBatch(ctx, streamID, 0, firstDigest, fingerprint, token, firstBody, time.Now().UTC())
+	if err != nil || first.Existing || first.FirstSequence != 1 || first.Count != 1 {
+		t.Fatalf("first receipt=%+v err=%v", first, err)
+	}
+	duplicate, err := store.AcceptBatch(ctx, streamID, 0, firstDigest, fingerprint, token, firstBody, time.Now().UTC())
+	if err != nil || !duplicate.Existing || duplicate.Commitment != first.Commitment {
+		t.Fatalf("duplicate receipt=%+v err=%v", duplicate, err)
+	}
+	secondBody := makeWitnessBatch(t, stream, 1, 2, 1, first.Commitment, "normal")
+	second, err := store.AcceptBatch(ctx, streamID, 1, manifestDigestText(secondBody), fingerprint, token, secondBody, time.Now().UTC())
+	if err != nil || second.FirstSequence != 2 {
+		t.Fatalf("second receipt=%+v err=%v", second, err)
+	}
+	gap := makeWitnessBatch(t, stream, 2, 4, 1, second.Commitment, "normal")
+	if _, err = store.AcceptBatch(ctx, streamID, 2, manifestDigestText(gap), fingerprint, token, gap, time.Now().UTC()); err == nil {
+		t.Fatal("accepted a skipped acceptance sequence")
+	}
+	conflict := makeWitnessBatch(t, stream, 1, 2, 1, first.Commitment, "conflicting-original")
+	if _, err = store.AcceptBatch(ctx, streamID, 1, manifestDigestText(conflict), fingerprint, token, conflict, time.Now().UTC()); !errors.Is(err, ErrConflict) {
+		t.Fatalf("conflicting original returned %v", err)
+	}
+	retry, err := store.AcceptBatch(ctx, streamID, 1, manifestDigestText(secondBody), fingerprint, token, secondBody, time.Now().UTC())
+	if err != nil || !retry.Existing {
+		t.Fatalf("exact immutable retry after incident = %+v, err=%v", retry, err)
+	}
+	third := makeWitnessBatch(t, stream, 2, 3, 1, second.Commitment, "normal")
+	if _, err = store.AcceptBatch(ctx, streamID, 2, manifestDigestText(third), fingerprint, token, third, time.Now().UTC()); err == nil {
+		t.Fatal("accepted a later batch after immutable manifest conflict")
+	}
+	var pending, stored, incidents int
+	if err = store.db.QueryRow("SELECT COUNT(*) FROM publication_jobs WHERE state='pending'").Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.db.QueryRow("SELECT COUNT(*) FROM batches").Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.db.QueryRow("SELECT COUNT(*) FROM batch_incidents WHERE kind='manifest_conflict'").Scan(&incidents); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 2 || stored != 2 || incidents != 1 {
+		t.Fatalf("publication jobs=%d batches=%d conflicts=%d", pending, stored, incidents)
+	}
+	queue, err := store.PublicationQueueStatus(ctx)
+	if err != nil || len(queue) != 1 || queue[0].Blocked == "" || queue[0].ByState["pending"] != 2 || queue[0].QueuedBytes == 0 {
+		t.Fatalf("publication queue status=%+v err=%v", queue, err)
+	}
+}
+
+func TestCountBatchIntakeEnforcesPerStreamQuota(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(filepath.Join(dir, "witness.db"), filepath.Join(dir, "manifests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	stream := integrity.Digest{77}
+	streamID := hex.EncodeToString(stream[:])
+	fingerprintDigest := integrity.Digest{88}
+	fingerprint := hex.EncodeToString(fingerprintDigest[:])
+	if err = store.EnrollBatch(context.Background(), streamID, fingerprint, "token"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.db.Exec(`UPDATE batch_streams SET max_manifest_count=0 WHERE stream_id=?`, streamID); err != nil {
+		t.Fatal(err)
+	}
+	body := makeWitnessBatch(t, stream, 0, 1, 1, integrity.Digest{}, "normal")
+	if _, err = store.AcceptBatch(context.Background(), streamID, 0, manifestDigestText(body), fingerprint, "token", body, time.Now().UTC()); err == nil {
+		t.Fatal("accepted manifest after per-stream quota was exhausted")
+	}
+	var count int
+	if err = store.db.QueryRow("SELECT COUNT(*) FROM batches").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("quota rejection stored %d batches (err=%v)", count, err)
+	}
+}
+
+func TestPublicationHistorySurvivesPublisherRemoval(t *testing.T) {
+	dir := t.TempDir()
+	dbPath, manifestDir := filepath.Join(dir, "witness.db"), filepath.Join(dir, "manifests")
+	store, err := NewStore(dbPath, manifestDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := integrity.Digest{91}
+	streamID := hex.EncodeToString(stream[:])
+	fingerprintDigest := integrity.Digest{92}
+	fingerprint := hex.EncodeToString(fingerprintDigest[:])
+	if err = store.EnrollBatch(context.Background(), streamID, fingerprint, "synthetic-token"); err != nil {
+		t.Fatal(err)
+	}
+	body := makeWitnessBatch(t, stream, 0, 1, 1, integrity.Digest{}, "history-preservation")
+	if _, err = store.AcceptBatch(context.Background(), streamID, 0, manifestDigestText(body), fingerprint, "synthetic-token", body, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	signed := []byte("synthetic-signed-transaction")
+	txHash, blockHash := integrity.Digest{93}, integrity.Digest{94}
+	_, err = store.db.Exec(`UPDATE publication_jobs SET state='included',chain_id='31337',contract_address='0x1111111111111111111111111111111111111111',nonce=7,signed_tx=?,tx_hash=?,fee_cap='1000000',submitted_at_ns=10,included_at_ns=20,block_number=3,block_hash=? WHERE stream_id=? AND batch_no=0`, signed, txHash[:], blockHash[:], streamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.db.Exec(`INSERT INTO publication_attempts(stream_id,batch_no,attempt_no,nonce,signed_tx,tx_hash,fee_cap,created_at_ns,sent_at_ns,last_error) VALUES(?,0,1,7,?,?, '1000000',10,20,'')`, streamID, signed, txHash[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.db.Exec(`INSERT INTO publication_receipt_history(stream_id,batch_no,tx_hash,block_number,block_hash,status,observed_at_ns) VALUES(?,0,?,3,?,'included',20)`, streamID, txHash[:], blockHash[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = NewStore(dbPath, manifestDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var version int
+	if err = store.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 4 {
+		t.Fatalf("schema version=%d err=%v", version, err)
+	}
+	var gotSigned, gotTxHash, gotBlockHash []byte
+	var state string
+	if err = store.db.QueryRow(`SELECT state,signed_tx,tx_hash,block_hash FROM publication_jobs WHERE stream_id=? AND batch_no=0`, streamID).Scan(&state, &gotSigned, &gotTxHash, &gotBlockHash); err != nil {
+		t.Fatal(err)
+	}
+	if state != "included" || !bytes.Equal(gotSigned, signed) || !bytes.Equal(gotTxHash, txHash[:]) || !bytes.Equal(gotBlockHash, blockHash[:]) {
+		t.Fatalf("publication history changed after reopen: state=%q signed=%x tx=%x block=%x", state, gotSigned, gotTxHash, gotBlockHash)
+	}
+	var attempts, receipts int
+	if err = store.db.QueryRow("SELECT COUNT(*) FROM publication_attempts WHERE stream_id=?", streamID).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.db.QueryRow("SELECT COUNT(*) FROM publication_receipt_history WHERE stream_id=?", streamID).Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 || receipts != 1 {
+		t.Fatalf("publication history counts changed: attempts=%d receipts=%d", attempts, receipts)
+	}
+	status, err := store.PublicationQueueStatus(context.Background())
+	if err != nil || len(status) != 1 || status[0].ByState["included"] != 1 {
+		t.Fatalf("preserved queue status=%+v err=%v", status, err)
+	}
+}
+
+func makeWitnessBatch(t *testing.T, stream integrity.Digest, batchNo, first, count uint64, previous integrity.Digest, content string) []byte {
+	t.Helper()
+	now := time.Now().UTC().Add(-time.Second).UnixNano()
+	entries := make([]integrity.BatchEntry, count)
+	for i := range entries {
+		seq := first + uint64(i)
+		entries[i] = integrity.BatchEntry{BatchNo: batchNo, Entry: integrity.Entry{
+			StreamID: stream, AcceptSeq: seq, AcceptedAt: now + int64(i), ReceivedAt: now,
+			RawID: fmt.Sprintf("deinopis-batch-%d-record-%d", batchNo, seq), Transport: "stdin", SourceIP: "local", Payload: []byte(fmt.Sprintf("%s-record-%d", content, seq)),
+		}}
+	}
+	m := integrity.BatchManifest{StreamID: stream, BatchNo: batchNo, FirstSequence: first, LastSequence: first + count - 1,
+		StartedAt: now, ClosedAt: now + int64(count), Previous: previous, Entries: entries}
+	body, err := integrity.EncodeBatchManifest(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
 }
 
 func TestWitnessRejectsUnauthorizedAndHeartbeatRollback(t *testing.T) {
@@ -226,6 +410,25 @@ func TestImmutableManifestRetrySurvivesWitnessRestart(t *testing.T) {
 	receipt, err := store.AcceptManifest(ctx, streamID, 0, digest, fingerprintText, token, body, time.Now().UTC())
 	if err != nil || !receipt.Existing {
 		t.Fatalf("restart retry = %+v, err=%v", receipt, err)
+	}
+}
+
+func TestManifestAuthorizationPrecedesParsing(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "witness.db"), filepath.Join(t.TempDir(), "manifests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var stream integrity.Digest
+	stream[0] = 99
+	fingerprint := manifestDigestText([]byte("client certificate fingerprint"))
+	epoch := time.Now().UTC().Truncate(300 * time.Second).Add(-300 * time.Second)
+	if err = store.Enroll(context.Background(), hex.EncodeToString(stream[:]), epoch, fingerprint, "correct-token"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.AcceptManifest(context.Background(), hex.EncodeToString(stream[:]), 0, manifestDigestText([]byte("malformed")), fingerprint, "wrong-token", []byte("malformed"), epoch.Add(300*time.Second))
+	if !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("unauthorized body reached manifest parser: %v", err)
 	}
 }
 

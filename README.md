@@ -4,10 +4,6 @@ DEINOPIS accepts heterogeneous logs, keeps their original bytes in a local SQLit
 
 The project includes a Go CLI/server, an embedded web management UI, YAML parser/source/sink definitions, and a synthetic log generator (`logsim`). It ships a reviewed set of local YAML parser packs and supports offline authoring, validation, testing, activation, and rollback. Configured cloud, broker, and output adapters retain their own network behavior. See [security guidance](SECURITY.md) before connecting real log sources.
 
-## Demo video
-
-[Watch the DEINOPIS demo on YouTube](https://youtu.be/jXnHJfCAKP0).
-
 ## Get started from source
 
 You need Git, Go 1.25 or newer, and Node.js/npm to **build**. The released CLI does not need Go, Node.js, npm, or a separate SQLite installation at runtime. From a terminal:

@@ -4,44 +4,54 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"deinopis/internal/witness"
 )
 
 func main() {
-	var listen, dbPath, manifestDir, streamID, epochText, certFingerprint, caPath, certPath, keyPath string
+	var listen, dbPath, manifestDir, streamID, certFingerprint, caPath, certPath, keyPath string
+	var statusOnly bool
 	flag.StringVar(&listen, "listen", ":9443", "mTLS listener address")
 	flag.StringVar(&dbPath, "db", "data/witness.db", "private witness SQLite database")
 	flag.StringVar(&manifestDir, "manifest-dir", "data/manifests", "private original manifest directory")
 	flag.StringVar(&streamID, "stream-id", os.Getenv("DEINOPIS_WITNESS_STREAM_ID"), "enrolled 32-byte stream ID")
-	flag.StringVar(&epochText, "epoch", os.Getenv("DEINOPIS_WITNESS_EPOCH"), "UTC 300-second aligned RFC3339 epoch")
 	flag.StringVar(&certFingerprint, "collector-cert-sha256", os.Getenv("DEINOPIS_COLLECTOR_CERT_SHA256"), "enrolled collector client certificate SHA-256")
 	flag.StringVar(&caPath, "client-ca", os.Getenv("DEINOPIS_WITNESS_CLIENT_CA"), "CA PEM for collector mTLS certificates")
 	flag.StringVar(&certPath, "tls-cert", os.Getenv("DEINOPIS_WITNESS_TLS_CERT"), "witness HTTPS certificate PEM")
 	flag.StringVar(&keyPath, "tls-key", os.Getenv("DEINOPIS_WITNESS_TLS_KEY"), "witness HTTPS private key PEM")
+	flag.BoolVar(&statusOnly, "status", false, "print preserved publication history and queue state, then exit")
 	flag.Parse()
 	token := os.Getenv("DEINOPIS_WITNESS_TOKEN")
-	if streamID == "" || epochText == "" || certFingerprint == "" || caPath == "" || certPath == "" || keyPath == "" || token == "" {
-		log.Fatal("witness requires stream, epoch, collector fingerprint, TLS files, and DEINOPIS_WITNESS_TOKEN")
-	}
-	epoch, err := time.Parse(time.RFC3339, epochText)
-	if err != nil {
-		log.Fatalf("invalid witness epoch: %v", err)
-	}
-	store, err := witness.NewStore(dbPath, manifestDir)
+	store, err := openWitnessStore(os.Environ(), dbPath, manifestDir)
 	if err != nil {
 		log.Fatalf("open witness store: %v", err)
 	}
 	defer store.Close()
-	if err = store.Enroll(context.Background(), streamID, epoch.UTC(), certFingerprint, token); err != nil {
-		log.Fatalf("enroll witness stream: %v", err)
+	if statusOnly {
+		status, statusErr := store.PublicationQueueStatus(context.Background())
+		if statusErr != nil {
+			log.Fatalf("read publication queue status: %v", statusErr)
+		}
+		if err = json.NewEncoder(os.Stdout).Encode(status); err != nil {
+			log.Fatalf("write publication queue status: %v", err)
+		}
+		return
 	}
+	if streamID == "" || certFingerprint == "" || caPath == "" || certPath == "" || keyPath == "" || token == "" {
+		log.Fatal("v2 witness requires stream, collector fingerprint, TLS files, and DEINOPIS_WITNESS_TOKEN")
+	}
+	if err = store.EnrollBatch(context.Background(), streamID, certFingerprint, token); err != nil {
+		log.Fatalf("enroll witness batch stream: %v", err)
+	}
+	log.Print("external chain publishing is disabled; existing publication history is preserved")
 	caBytes, err := os.ReadFile(caPath)
 	if err != nil {
 		log.Fatalf("read client CA: %v", err)
@@ -60,4 +70,21 @@ func main() {
 	if err = server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("witness server: %v", err)
 	}
+}
+
+func openWitnessStore(environ []string, dbPath, manifestDir string) (*witness.Store, error) {
+	if err := rejectExternalPublisherEnvironment(environ); err != nil {
+		return nil, err
+	}
+	return witness.NewStore(dbPath, manifestDir)
+}
+
+func rejectExternalPublisherEnvironment(environ []string) error {
+	for _, entry := range environ {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(name, "DEINOPIS_CHAIN_") || strings.HasPrefix(name, "DEINOPIS_REGISTRY_") || name == "DEINOPIS_PUBLISHER_KEY_FILE" {
+			return fmt.Errorf("external chain publishing is disabled; remove retired setting %s (no database or network action was taken)", name)
+		}
+	}
+	return nil
 }

@@ -508,6 +508,11 @@ PRAGMA user_version=1;`
 	if _, err := db.Exec(legacy); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.Exec(`INSERT INTO raw_events VALUES('legacy-raw','legacy-hash',6,'stdin','local','2026-01-01T00:00:00Z',X'6c6567616379','accepted');
+		INSERT INTO quarantine VALUES('legacy-quarantine','legacy-raw','legacy-hash','decode','bad synthetic fixture',NULL,'legacy preview',NULL,1,'2026-01-01T00:00:01Z',NULL);
+		INSERT INTO normalized_events VALUES('legacy-event','legacy-raw','test','synthetic',1,'activity','legacy message',1,'2026-01-01T00:00:00Z','{}','legacy-event-hash');`); err != nil {
+		t.Fatal(err)
+	}
 	if err := initSchema(db); err != nil {
 		t.Fatalf("migrate legacy schema: %v", err)
 	}
@@ -523,6 +528,16 @@ PRAGMA user_version=1;`
 		if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('raw_events') WHERE name=?", col).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("expected raw_events.%s after migration, count=%d err=%v", col, count, err)
 		}
+	}
+	var rawPayload, quarantineReason, normalizedMessage string
+	if err = db.QueryRow(`SELECT payload FROM raw_events WHERE raw_id='legacy-raw'`).Scan(&rawPayload); err != nil || rawPayload != "legacy" {
+		t.Fatalf("legacy raw bytes changed during migration: payload=%q err=%v", rawPayload, err)
+	}
+	if err = db.QueryRow(`SELECT reason FROM quarantine WHERE quarantine_id='legacy-quarantine'`).Scan(&quarantineReason); err != nil || quarantineReason != "bad synthetic fixture" {
+		t.Fatalf("legacy quarantine row changed during migration: reason=%q err=%v", quarantineReason, err)
+	}
+	if err = db.QueryRow(`SELECT message FROM normalized_events WHERE event_id='legacy-event'`).Scan(&normalizedMessage); err != nil || normalizedMessage != "legacy message" {
+		t.Fatalf("legacy normalized row changed during migration: message=%q err=%v", normalizedMessage, err)
 	}
 }
 

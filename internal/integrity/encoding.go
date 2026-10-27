@@ -49,6 +49,10 @@ type Manifest struct {
 }
 
 func EncodeEntry(e Entry) ([]byte, error) {
+	return encodeEntry(e, "DEINOPIS-ENTRY-V1")
+}
+
+func encodeEntry(e Entry, domain string) ([]byte, error) {
 	if e.AcceptedAt < 0 || e.ReceivedAt < 0 || e.AcceptSeq == 0 || e.RawID == "" || !asciiBounded(e.RawID, 128) || !asciiBounded(e.Transport, 64) || !asciiOrEmpty(e.SourceIP, 256) {
 		return nil, errors.New("invalid integrity entry identity or time")
 	}
@@ -83,7 +87,7 @@ func EncodeEntry(e Entry) ([]byte, error) {
 	}
 
 	var b bytes.Buffer
-	b.WriteString("DEINOPIS-ENTRY-V1")
+	b.WriteString(domain)
 	b.Write(e.StreamID[:])
 	_ = binary.Write(&b, binary.BigEndian, e.Slot)
 	_ = binary.Write(&b, binary.BigEndian, e.AcceptSeq)

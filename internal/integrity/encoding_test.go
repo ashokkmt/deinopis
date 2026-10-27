@@ -2,6 +2,7 @@ package integrity
 
 import (
 	"encoding/hex"
+	"fmt"
 	"testing"
 
 	"deinopis/internal/model"
@@ -93,5 +94,82 @@ func TestEntryAndManifestRejectInvalidMetadataAndOrder(t *testing.T) {
 	m := Manifest{StreamID: stream, Slot: 0, Start: 0, End: 300, Entries: []Entry{entry, entry}}
 	if _, err := EncodeManifest(m); err == nil {
 		t.Fatal("duplicate acceptance sequence accepted")
+	}
+}
+
+func TestCountBatchV2ManifestIsDeterministicAndSeparateFromV1(t *testing.T) {
+	stream := Digest{1, 2, 3}
+	entries := []BatchEntry{
+		{Entry: Entry{StreamID: stream, AcceptSeq: 1, AcceptedAt: 1_000, RawID: "deinopis-raw-a", ReceivedAt: 900, Transport: "stdin", Payload: []byte("same")}, BatchNo: 7},
+		{Entry: Entry{StreamID: stream, AcceptSeq: 2, AcceptedAt: 1_100, RawID: "deinopis-raw-b", ReceivedAt: 950, Transport: "stdin", Payload: []byte("same")}, BatchNo: 7},
+		{Entry: Entry{StreamID: stream, AcceptSeq: 3, AcceptedAt: 1_200, RawID: "deinopis-raw-c", ReceivedAt: 1_000, Transport: "stdin", Payload: []byte("third")}, BatchNo: 7},
+	}
+	m := BatchManifest{StreamID: stream, BatchNo: 7, FirstSequence: 1, LastSequence: 3, StartedAt: 1_000, ClosedAt: 1_500, Entries: entries}
+	encoded, err := EncodeBatchManifest(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseBatchManifest(encoded)
+	if err != nil || parsed.Count != 3 || parsed.BatchNo != 7 || parsed.FirstSequence != 1 || parsed.LastSequence != 3 {
+		t.Fatalf("parsed v2 batch = %+v, err=%v", parsed, err)
+	}
+	commitment, err := BatchCommitment(m, encoded)
+	if err != nil || commitment != parsed.Commitment {
+		t.Fatalf("commitment mismatch: %x != %x (err=%v)", commitment, parsed.Commitment, err)
+	}
+	if _, err = ParseManifest(encoded); err == nil {
+		t.Fatal("v1 parser accepted a v2 batch")
+	}
+	mutated := append([]byte(nil), encoded...)
+	mutated[len(mutated)-1] ^= 1
+	if _, err = ParseBatchManifest(mutated); err == nil {
+		t.Fatal("v2 parser accepted a changed entry")
+	}
+	entries[2].AcceptSeq = 4
+	if _, err = EncodeBatchManifest(m); err == nil {
+		t.Fatal("v2 encoder accepted a noncontiguous sequence")
+	}
+}
+
+func TestStreamingMerkleAccumulatorMatchesCanonicalRoot(t *testing.T) {
+	for size := 0; size <= 257; size++ {
+		entries := make([][]byte, size)
+		leaves := make([]Digest, size)
+		var accumulator MerkleAccumulator
+		for i := range entries {
+			entries[i] = []byte(fmt.Sprintf("entry-%d", i))
+			leaves[i] = leaf(entries[i])
+			if err := accumulator.AddEntry(entries[i]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got, want := accumulator.Root(), Root(leaves); got != want {
+			t.Fatalf("size %d: streaming root %x != canonical %x", size, got, want)
+		}
+		if accumulator.Count() != uint64(size) {
+			t.Fatalf("size %d: accumulator count %d", size, accumulator.Count())
+		}
+	}
+}
+
+func TestVerifyProofRejectsHostileBoundsAndNoncanonicalEntries(t *testing.T) {
+	stream := Digest{1}
+	entry := Entry{StreamID: stream, Slot: 2, AcceptSeq: 1, AcceptedAt: 600_000_000_000, RawID: "deinopis-raw-a", ReceivedAt: 600_000_000_000, Transport: "stdin", SourceIP: "local"}
+	encoded, err := EncodeEntry(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, root, err := BuildProof([][]byte{encoded}, 0, stream, 2)
+	if err != nil || !VerifyProof(proof, stream, 2, root) {
+		t.Fatalf("valid proof rejected: %v", err)
+	}
+	proof.Size = ^uint64(0)
+	if VerifyProof(proof, stream, 2, root) {
+		t.Fatal("accepted hostile tree size")
+	}
+	proof.Size = 1
+	proof.Entry = append(append([]byte(nil), encoded...), 0)
+	if VerifyProof(proof, stream, 2, root) {
+		t.Fatal("accepted noncanonical entry bytes")
 	}
 }

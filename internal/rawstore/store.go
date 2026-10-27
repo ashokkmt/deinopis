@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,7 @@ import (
 
 	"deinopis/internal/integrity"
 	"deinopis/internal/model"
+	"github.com/shirou/gopsutil/disk"
 
 	_ "modernc.org/sqlite"
 )
@@ -24,7 +27,10 @@ import (
 // RawStore provides durable, cryptographically verified storage for raw byte streams.
 type RawStore struct {
 	db       *sql.DB
+	readerDB *sql.DB
+	dbPath   string
 	writeMu  sync.Mutex
+	sealMu   sync.Mutex
 	uploadMu sync.Mutex
 	counter  atomic.Uint64
 }
@@ -61,12 +67,30 @@ func New(dbPath string) (*RawStore, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := ensureVaultBatchStream(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	readerDB := db
+	if dbPath != ":memory:" {
+		readerDB, err = sql.Open("sqlite", dbPath)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("open vault snapshot reader: %w", err)
+		}
+		readerDB.SetMaxOpenConns(1)
+		if _, err = readerDB.Exec("PRAGMA query_only=ON"); err != nil {
+			readerDB.Close()
+			db.Close()
+			return nil, fmt.Errorf("configure vault snapshot reader: %w", err)
+		}
+	}
 
-	return &RawStore{db: db}, nil
+	return &RawStore{db: db, readerDB: readerDB, dbPath: dbPath}, nil
 }
 
 // CurrentSchemaVersion tracks the active database schema migration version.
-const CurrentSchemaVersion = 5
+const CurrentSchemaVersion = 9
 
 func initSchema(db *sql.DB) error {
 	tx, err := db.Begin()
@@ -237,6 +261,127 @@ func migrateSchema(db sqlExecutor) error {
 		version = 5
 	}
 
+	if version < 6 {
+		// Keep acceptance limits O(1) and persist the close boundary independently
+		// from the expensive manifest build so a restart cannot reopen a slot.
+		if _, err := db.Exec(`CREATE TABLE vault_slot_state (
+			stream_id TEXT NOT NULL REFERENCES vault_streams(stream_id),
+			slot INTEGER NOT NULL CHECK(slot >= 0),
+			member_count INTEGER NOT NULL CHECK(member_count >= 0),
+			encoded_bytes INTEGER NOT NULL CHECK(encoded_bytes >= 0),
+			high_water_sequence INTEGER NOT NULL CHECK(high_water_sequence >= 0),
+			closed INTEGER NOT NULL DEFAULT 0 CHECK(closed IN (0,1)),
+			closed_at_ns INTEGER,
+			PRIMARY KEY(stream_id,slot)
+		);
+		INSERT INTO vault_slot_state(stream_id,slot,member_count,encoded_bytes,high_water_sequence,closed,closed_at_ns)
+		SELECT m.stream_id,m.slot,COUNT(*),SUM(m.entry_bytes+4),MAX(m.accept_seq),
+			CASE WHEN EXISTS(SELECT 1 FROM vault_windows w WHERE w.stream_id=m.stream_id AND w.slot=m.slot) THEN 1 ELSE 0 END,
+			(SELECT w.sealed_at_ns FROM vault_windows w WHERE w.stream_id=m.stream_id AND w.slot=m.slot)
+		FROM vault_members m GROUP BY m.stream_id,m.slot;
+		INSERT OR IGNORE INTO vault_slot_state(stream_id,slot,member_count,encoded_bytes,high_water_sequence,closed,closed_at_ns)
+		SELECT stream_id,slot,entry_count,COALESCE((SELECT SUM(entry_bytes+4) FROM vault_members m WHERE m.stream_id=w.stream_id AND m.slot=w.slot),0),high_water_sequence,1,sealed_at_ns
+		FROM vault_windows w;
+		CREATE TABLE vault_seal_tasks (
+			stream_id TEXT NOT NULL,
+			slot INTEGER NOT NULL,
+			coverage INTEGER NOT NULL CHECK(coverage BETWEEN 0 AND 2),
+			member_count INTEGER NOT NULL CHECK(member_count >= 0),
+			encoded_bytes INTEGER NOT NULL CHECK(encoded_bytes >= 0),
+			high_water_sequence INTEGER NOT NULL CHECK(high_water_sequence >= 0),
+			closed_at_ns INTEGER NOT NULL,
+			PRIMARY KEY(stream_id,slot),
+			FOREIGN KEY(stream_id,slot) REFERENCES vault_slot_state(stream_id,slot)
+		);
+		PRAGMA user_version=6;`); err != nil {
+			return fmt.Errorf("migrate vault counters and durable close state: %w", err)
+		}
+		version = 6
+	}
+	if version < 7 {
+		if _, err := db.Exec(`CREATE TABLE vault_uploads_v7 (
+			stream_id TEXT NOT NULL,
+			slot INTEGER NOT NULL,
+			state TEXT NOT NULL CHECK(state IN ('pending','uploaded','blocked')),
+			attempts INTEGER NOT NULL DEFAULT 0,
+			retry_at_ns INTEGER NOT NULL,
+			last_error TEXT,
+			witness_receipt TEXT,
+			PRIMARY KEY(stream_id,slot),
+			FOREIGN KEY(stream_id,slot) REFERENCES vault_windows(stream_id,slot)
+		);
+		INSERT INTO vault_uploads_v7 SELECT * FROM vault_uploads;
+		DROP TABLE vault_uploads;
+		ALTER TABLE vault_uploads_v7 RENAME TO vault_uploads;
+		CREATE INDEX idx_vault_uploads_pending ON vault_uploads(state,retry_at_ns);
+		PRAGMA user_version=7;`); err != nil {
+			return fmt.Errorf("migrate permanent witness upload state: %w", err)
+		}
+		version = 7
+	}
+	if version < 8 {
+		if _, err := db.Exec(`ALTER TABLE vault_streams ADD COLUMN pending_upload_count INTEGER NOT NULL DEFAULT 0 CHECK(pending_upload_count >= 0);
+		ALTER TABLE vault_streams ADD COLUMN pending_upload_bytes INTEGER NOT NULL DEFAULT 0 CHECK(pending_upload_bytes >= 0);
+		UPDATE vault_streams SET
+			pending_upload_count=(SELECT COUNT(*) FROM vault_uploads WHERE state IN ('pending','blocked')),
+			pending_upload_bytes=COALESCE((SELECT SUM(length(w.manifest)) FROM vault_uploads u JOIN vault_windows w USING(stream_id,slot) WHERE u.state IN ('pending','blocked')),0);
+		PRAGMA user_version=8;`); err != nil {
+			return fmt.Errorf("migrate bounded upload backlog counters: %w", err)
+		}
+		version = 8
+	}
+	if version < 9 {
+		if _, err := db.Exec(`CREATE TABLE vault_batch_streams (
+			id INTEGER PRIMARY KEY CHECK(id=1), format_version INTEGER NOT NULL DEFAULT 2 CHECK(format_version=2),
+			stream_id TEXT NOT NULL UNIQUE, next_sequence INTEGER NOT NULL DEFAULT 1 CHECK(next_sequence>0),
+			next_batch_no INTEGER NOT NULL DEFAULT 0 CHECK(next_batch_no>=0), last_sealed_batch_no INTEGER NOT NULL DEFAULT -1,
+			last_commitment BLOB NOT NULL CHECK(length(last_commitment)=32), target_count INTEGER NOT NULL DEFAULT 30000 CHECK(target_count>0),
+			soft_manifest_bytes INTEGER NOT NULL DEFAULT 16777216 CHECK(soft_manifest_bytes>0), max_age_ns INTEGER NOT NULL DEFAULT 300000000000 CHECK(max_age_ns>0),
+			hard_count INTEGER NOT NULL DEFAULT 50000 CHECK(hard_count>0), hard_manifest_bytes INTEGER NOT NULL DEFAULT 67108864 CHECK(hard_manifest_bytes>0),
+			pending_upload_count INTEGER NOT NULL DEFAULT 0 CHECK(pending_upload_count>=0), pending_upload_bytes INTEGER NOT NULL DEFAULT 0 CHECK(pending_upload_bytes>=0),
+			blocked_reason TEXT
+		);
+		CREATE TABLE vault_batch_state (
+			stream_id TEXT NOT NULL REFERENCES vault_batch_streams(stream_id), batch_no INTEGER NOT NULL CHECK(batch_no>=0),
+			first_sequence INTEGER NOT NULL CHECK(first_sequence>0), high_water_sequence INTEGER NOT NULL CHECK(high_water_sequence>=first_sequence),
+			member_count INTEGER NOT NULL CHECK(member_count>0), encoded_bytes INTEGER NOT NULL CHECK(encoded_bytes>0),
+			started_at_ns INTEGER NOT NULL CHECK(started_at_ns>=0), closed INTEGER NOT NULL DEFAULT 0 CHECK(closed IN (0,1)),
+			closed_at_ns INTEGER, close_reason TEXT CHECK(close_reason IN ('count','bytes','age')),
+			PRIMARY KEY(stream_id,batch_no)
+		);
+		CREATE TABLE vault_batch_members (
+			stream_id TEXT NOT NULL REFERENCES vault_batch_streams(stream_id), accept_seq INTEGER NOT NULL CHECK(accept_seq>0),
+			raw_id TEXT NOT NULL UNIQUE REFERENCES raw_events(raw_id) ON DELETE RESTRICT, batch_no INTEGER NOT NULL CHECK(batch_no>=0),
+			accepted_at_ns INTEGER NOT NULL CHECK(accepted_at_ns>=0), entry_bytes INTEGER NOT NULL CHECK(entry_bytes>0),
+			PRIMARY KEY(stream_id,accept_seq), FOREIGN KEY(stream_id,batch_no) REFERENCES vault_batch_state(stream_id,batch_no)
+		);
+		CREATE INDEX idx_vault_batch_members_order ON vault_batch_members(stream_id,batch_no,accept_seq);
+		CREATE TABLE vault_batch_seal_tasks (
+			stream_id TEXT NOT NULL, batch_no INTEGER NOT NULL, first_sequence INTEGER NOT NULL, high_water_sequence INTEGER NOT NULL,
+			member_count INTEGER NOT NULL, encoded_bytes INTEGER NOT NULL, started_at_ns INTEGER NOT NULL,
+			closed_at_ns INTEGER NOT NULL, close_reason TEXT NOT NULL CHECK(close_reason IN ('count','bytes','age')),
+			PRIMARY KEY(stream_id,batch_no), FOREIGN KEY(stream_id,batch_no) REFERENCES vault_batch_state(stream_id,batch_no)
+		);
+		CREATE TABLE vault_batch_manifests (
+			stream_id TEXT NOT NULL REFERENCES vault_batch_streams(stream_id), batch_no INTEGER NOT NULL, first_sequence INTEGER NOT NULL,
+			high_water_sequence INTEGER NOT NULL, member_count INTEGER NOT NULL, started_at_ns INTEGER NOT NULL, closed_at_ns INTEGER NOT NULL,
+			close_reason TEXT NOT NULL CHECK(close_reason IN ('count','bytes','age')), manifest BLOB NOT NULL,
+			manifest_digest BLOB NOT NULL CHECK(length(manifest_digest)=32), merkle_root BLOB NOT NULL CHECK(length(merkle_root)=32),
+			previous_commitment BLOB NOT NULL CHECK(length(previous_commitment)=32), commitment BLOB NOT NULL CHECK(length(commitment)=32),
+			sealed_at_ns INTEGER NOT NULL, PRIMARY KEY(stream_id,batch_no)
+		);
+		CREATE TABLE vault_batch_uploads (
+			stream_id TEXT NOT NULL, batch_no INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','uploaded','blocked')),
+			attempts INTEGER NOT NULL DEFAULT 0, retry_at_ns INTEGER NOT NULL, last_error TEXT, witness_receipt TEXT,
+			PRIMARY KEY(stream_id,batch_no), FOREIGN KEY(stream_id,batch_no) REFERENCES vault_batch_manifests(stream_id,batch_no)
+		);
+		CREATE INDEX idx_vault_batch_uploads_pending ON vault_batch_uploads(state,retry_at_ns);
+		PRAGMA user_version=9;`); err != nil {
+			return fmt.Errorf("create version-2 batch integrity schema: %w", err)
+		}
+		version = 9
+	}
+
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d;", CurrentSchemaVersion)); err != nil {
 		return fmt.Errorf("failed to set user_version: %w", err)
 	}
@@ -251,8 +396,22 @@ type sqlExecutor interface {
 
 // Store commits verbatim raw bytes, calculates SHA-256 digest, and assigns an immutable raw ID.
 func (s *RawStore) Store(ctx context.Context, rec model.IngestedRecord) (*model.RawEvent, error) {
+	if s.dbPath != ":memory:" {
+		usage, err := disk.Usage(filepath.Dir(s.dbPath))
+		if err != nil {
+			return nil, fmt.Errorf("check raw store disk watermark: %w", err)
+		}
+		if usage.UsedPercent >= 85 {
+			return nil, errors.New("raw store disk watermark reached; raw acceptance refused")
+		}
+	}
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	writeLocked := true
+	defer func() {
+		if writeLocked {
+			s.writeMu.Unlock()
+		}
+	}()
 
 	if rec.ReceivedAt.IsZero() {
 		rec.ReceivedAt = time.Now().UTC()
@@ -266,8 +425,8 @@ func (s *RawStore) Store(ctx context.Context, rec model.IngestedRecord) (*model.
 		return nil, fmt.Errorf("begin raw acceptance transaction: %w", err)
 	}
 	defer tx.Rollback()
-	if err = s.sealDueWindowsTx(ctx, tx, acceptedAt); err != nil {
-		return nil, fmt.Errorf("close elapsed evidence windows: %w", err)
+	if err = sealDueVaultBatchesTx(ctx, tx, acceptedAt); err != nil {
+		return nil, fmt.Errorf("close expired evidence batches: %w", err)
 	}
 	if rec.Transport == "file" && rec.Metadata.FileID != "" {
 		var existingID, existingHash string
@@ -293,21 +452,10 @@ func (s *RawStore) Store(ctx context.Context, rec model.IngestedRecord) (*model.
 		}
 	}
 	var streamID string
-	var epoch, windowSeconds int64
-	var sequence uint64
-	if err = tx.QueryRowContext(ctx, "SELECT stream_id,epoch_start,window_seconds,next_sequence FROM vault_streams WHERE id=1").Scan(&streamID, &epoch, &windowSeconds, &sequence); err != nil {
+	var sequence, nextBatch uint64
+	var hardCount, hardBytes, softBytes, targetCount, pendingCount, pendingBytes int64
+	if err = tx.QueryRowContext(ctx, `SELECT stream_id,next_sequence,next_batch_no,hard_count,hard_manifest_bytes,soft_manifest_bytes,target_count,pending_upload_count,pending_upload_bytes FROM vault_batch_streams WHERE id=1`).Scan(&streamID, &sequence, &nextBatch, &hardCount, &hardBytes, &softBytes, &targetCount, &pendingCount, &pendingBytes); err != nil {
 		return nil, err
-	}
-	if windowSeconds != vaultWindowSeconds || acceptedAt.Unix() < epoch {
-		return nil, errors.New("raw acceptance is outside the enrolled vault schedule")
-	}
-	slot := (acceptedAt.Unix() - epoch) / windowSeconds
-	var sealed int
-	if err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM vault_windows WHERE stream_id=? AND slot=?", streamID, slot).Scan(&sealed); err != nil {
-		return nil, err
-	}
-	if sealed != 0 {
-		return nil, errors.New("raw acceptance arrived after its vault window was sealed")
 	}
 	if sequence == 0 || sequence >= math.MaxInt64 {
 		return nil, errors.New("vault acceptance sequence exhausted")
@@ -337,22 +485,64 @@ func (s *RawStore) Store(ctx context.Context, rec model.IngestedRecord) (*model.
 	}
 	streamBytes, err := hex.DecodeString(streamID)
 	if err != nil || len(streamBytes) != 32 {
-		return nil, errors.New("stored vault stream ID is invalid")
+		return nil, errors.New("stored v2 stream ID is invalid")
 	}
 	var streamDigest integrity.Digest
 	copy(streamDigest[:], streamBytes)
-	encodedEntry, err := integrity.EncodeEntry(integrity.Entry{StreamID: streamDigest, Slot: uint64(slot), AcceptSeq: sequence, AcceptedAt: acceptedAt.UnixNano(), RawID: rawID, ReceivedAt: rec.ReceivedAt.UnixNano(), Transport: rec.Transport, SourceIP: rec.SourceIP, SourcePort: uint16(rec.SourcePort), Metadata: rec.Metadata, Payload: rec.RawBytes})
-	if err != nil {
-		return nil, fmt.Errorf("raw record is outside the vault contract: %w", err)
-	}
-	var windowCount int
-	var windowBytes int64
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(entry_bytes+4),0) FROM vault_members WHERE stream_id=? AND slot=?`, streamID, slot).Scan(&windowCount, &windowBytes); err != nil {
+	var batchNo, batchCount, batchBytes, firstSequence, highWater uint64
+	var startedAt int64
+	activeBatch := true
+	batchNo = nextBatch
+	err = tx.QueryRowContext(ctx, `SELECT member_count,encoded_bytes,first_sequence,high_water_sequence,started_at_ns FROM vault_batch_state WHERE stream_id=? AND batch_no=? AND closed=0`, streamID, batchNo).Scan(&batchCount, &batchBytes, &firstSequence, &highWater, &startedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		activeBatch = false
+	} else if err != nil {
 		return nil, err
 	}
-	const manifestHeaderBytes = int64(len("DEINOPIS-MANIFEST-V1") + 2 + 32 + 8 + 8 + 8 + 1 + 8 + 32 + 32)
-	if windowCount >= maxWindowMembers || windowBytes+int64(len(encodedEntry))+4+manifestHeaderBytes > maxWindowBytes {
-		return nil, errors.New("vault window member or manifest limit reached; raw acceptance refused")
+	encodeRecord := func(batch uint64) ([]byte, error) {
+		return integrity.EncodeBatchEntry(integrity.BatchEntry{Entry: integrity.Entry{StreamID: streamDigest, AcceptSeq: sequence,
+			AcceptedAt: acceptedAt.UnixNano(), RawID: rawID, ReceivedAt: rec.ReceivedAt.UnixNano(), Transport: rec.Transport,
+			SourceIP: rec.SourceIP, SourcePort: uint16(rec.SourcePort), Metadata: rec.Metadata, Payload: rec.RawBytes}, BatchNo: batch})
+	}
+	encodedEntry, err := encodeRecord(batchNo)
+	if err != nil {
+		return nil, fmt.Errorf("raw record is outside the v2 vault contract: %w", err)
+	}
+	entryBytes := int64(len(encodedEntry) + 4)
+	if entryBytes+vaultBatchHeaderSize > hardBytes || hardCount <= 0 || targetCount <= 0 || softBytes <= 0 {
+		return nil, errors.New("raw record exceeds the v2 batch hard manifest limit")
+	}
+	if activeBatch && batchCount > 0 && (int64(batchBytes)+entryBytes+vaultBatchHeaderSize > softBytes || batchCount >= uint64(hardCount) || int64(batchBytes)+entryBytes+vaultBatchHeaderSize > hardBytes) {
+		if err = closeVaultBatchTx(ctx, tx, streamID, batchNo, acceptedAt, "bytes"); err != nil {
+			return nil, err
+		}
+		if err = tx.QueryRowContext(ctx, `SELECT pending_upload_count,pending_upload_bytes FROM vault_batch_streams WHERE id=1`).Scan(&pendingCount, &pendingBytes); err != nil {
+			return nil, err
+		}
+		batchNo++
+		batchCount, batchBytes, firstSequence, highWater, startedAt = 0, 0, 0, 0, 0
+		activeBatch = false
+		encodedEntry, err = encodeRecord(batchNo)
+		if err != nil {
+			return nil, err
+		}
+		entryBytes = int64(len(encodedEntry) + 4)
+	}
+	if batchCount+1 > uint64(hardCount) || entryBytes+vaultBatchHeaderSize > hardBytes {
+		return nil, errors.New("v2 batch hard member or byte limit reached; raw acceptance refused")
+	}
+	var oldest sql.NullInt64
+	if err = tx.QueryRowContext(ctx, `SELECT MIN(closed_ns) FROM (
+		SELECT closed_at_ns AS closed_ns FROM vault_batch_seal_tasks
+		UNION ALL SELECT m.sealed_at_ns FROM vault_batch_uploads u JOIN vault_batch_manifests m USING(stream_id,batch_no) WHERE u.state IN ('pending','blocked')
+	)`).Scan(&oldest); err != nil {
+		return nil, err
+	}
+	if oldest.Valid && acceptedAt.Sub(time.Unix(0, oldest.Int64)) > maxPendingAge {
+		return nil, errors.New("v2 witness backlog exceeded its age budget; raw acceptance refused")
+	}
+	if pendingCount >= maxPendingUploads || pendingBytes+int64(batchBytes)+entryBytes+vaultBatchHeaderSize > maxPendingBytes {
+		return nil, errors.New("v2 witness backlog reached its count or byte budget; raw acceptance refused")
 	}
 
 	metadataJSON, err := json.Marshal(event.Metadata)
@@ -377,14 +567,49 @@ func (s *RawStore) Store(ctx context.Context, rec model.IngestedRecord) (*model.
 	); err != nil {
 		return nil, fmt.Errorf("failed to persist raw record %s: %w", rawID, err)
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO vault_members(stream_id,accept_seq,raw_id,slot,accepted_at_ns,entry_bytes) VALUES(?,?,?,?,?,?)`, streamID, sequence, rawID, slot, acceptedAt.UnixNano(), len(encodedEntry)); err != nil {
-		return nil, fmt.Errorf("failed to persist vault membership for %s: %w", rawID, err)
+	if !activeBatch {
+		firstSequence, highWater, batchCount, batchBytes, startedAt = sequence, sequence, 1, uint64(entryBytes), acceptedAt.UnixNano()
+		if _, err = tx.ExecContext(ctx, `INSERT INTO vault_batch_state(stream_id,batch_no,first_sequence,high_water_sequence,member_count,encoded_bytes,started_at_ns) VALUES(?,?,?,?,1,?,?)`, streamID, batchNo, sequence, sequence, entryBytes, startedAt); err != nil {
+			return nil, fmt.Errorf("failed to initialize v2 batch counters: %w", err)
+		}
 	}
-	if _, err = tx.ExecContext(ctx, "UPDATE vault_streams SET next_sequence=? WHERE id=1", sequence+1); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO vault_batch_members(stream_id,accept_seq,raw_id,batch_no,accepted_at_ns,entry_bytes) VALUES(?,?,?,?,?,?)`, streamID, sequence, rawID, batchNo, acceptedAt.UnixNano(), len(encodedEntry)); err != nil {
+		return nil, fmt.Errorf("failed to persist v2 batch membership for %s: %w", rawID, err)
+	}
+	if activeBatch {
+		if _, err = tx.ExecContext(ctx, `UPDATE vault_batch_state SET member_count=member_count+1,encoded_bytes=encoded_bytes+?,high_water_sequence=? WHERE stream_id=? AND batch_no=? AND closed=0`, entryBytes, sequence, streamID, batchNo); err != nil {
+			return nil, fmt.Errorf("failed to update v2 batch counters: %w", err)
+		}
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE vault_batch_streams SET next_sequence=? WHERE id=1", sequence+1); err != nil {
 		return nil, fmt.Errorf("failed to advance vault sequence: %w", err)
+	}
+	newCount, newBytes := batchCount, batchBytes
+	if activeBatch {
+		newCount++
+		newBytes += uint64(entryBytes)
+	} else {
+		newCount = 1
+		newBytes = uint64(entryBytes)
+	}
+	closeReason := ""
+	if newCount >= uint64(targetCount) || newCount >= uint64(hardCount) {
+		closeReason = "count"
+	} else if int64(newBytes)+vaultBatchHeaderSize >= softBytes || int64(newBytes)+vaultBatchHeaderSize >= hardBytes {
+		closeReason = "bytes"
+	}
+	if closeReason != "" {
+		if err = closeVaultBatchTx(ctx, tx, streamID, batchNo, acceptedAt, closeReason); err != nil {
+			return nil, err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit raw acceptance and membership: %w", err)
+	}
+	s.writeMu.Unlock()
+	writeLocked = false
+	if err = s.processVaultBatchSealTasks(ctx, acceptedAt); err != nil {
+		log.Printf("v2 batch seal remains pending after raw acceptance: %v", err)
 	}
 
 	return event, nil
@@ -1199,5 +1424,11 @@ func (s *RawStore) Ping(ctx context.Context) error {
 
 // Close closes the underlying SQLite database handle.
 func (s *RawStore) Close() error {
-	return s.db.Close()
+	err := s.readerDB.Close()
+	if s.readerDB != s.db {
+		if closeErr := s.db.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
 }

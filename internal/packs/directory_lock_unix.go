@@ -43,10 +43,3 @@ func (l *DirectoryLock) Close() error {
 	}
 	return first
 }
-
-func closeFiles(files []*os.File) {
-	for _, f := range files {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}
-}

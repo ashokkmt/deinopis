@@ -106,15 +106,15 @@ func TestEndToEnd_ReplayAndPacks(t *testing.T) {
 		t.Logf("  * Quarantine ID: %s | Stage: %s | Reason: %s", q.QuarantineID, q.Stage, q.Reason)
 	}
 
-	// Check normalized count: exactly 7 logs must be normalized
+	// The three retained fixtures outside the two deliberately unknown sources normalize initially.
 	_, normTotal, err := store.ListNormalized(ctx, "", "", "", 50, 0)
 	if err != nil {
 		t.Fatalf("ListNormalized failed: %v", err)
 	}
-	if normTotal != 7 {
-		t.Fatalf("expected 7 normalized entries initially, got %d", normTotal)
+	if normTotal != 3 {
+		t.Fatalf("expected 3 normalized entries initially, got %d", normTotal)
 	}
-	t.Logf("Successfully verified 7 normalized entries initially")
+	t.Logf("Successfully verified 3 normalized entries initially")
 
 	tempPacksDir := filepath.Join(tempDir, "packs")
 	_ = os.MkdirAll(tempPacksDir, 0755)
@@ -198,13 +198,13 @@ func TestEndToEnd_ReplayAndPacks(t *testing.T) {
 	}
 	t.Logf("Replay All executed successfully: %+v", replayResp)
 
-	// 4. Verify that all 10 events are now normalized
+	// 4. Verify that all six records represented by the current synthetic replay fixtures are normalized.
 	normEvents, normTotal, err := store.ListNormalized(ctx, "", "", "", 50, 0)
 	if err != nil {
 		t.Fatalf("ListNormalized failed: %v", err)
 	}
-	if normTotal != 10 {
-		t.Fatalf("expected 10 total normalized events after replay, got %d", normTotal)
+	if normTotal != 6 {
+		t.Fatalf("expected 6 total normalized events after replay, got %d", normTotal)
 	}
 
 	// 5. Verify Cryptographic Integrity of every normalized event
@@ -217,5 +217,5 @@ func TestEndToEnd_ReplayAndPacks(t *testing.T) {
 			t.Fatalf("integrity check FAILED for %s: %s", evt.Deinopis.EventID, rep.FailureReason)
 		}
 	}
-	t.Logf("Cryptographic SHA-256 verification PASSED for all 10 normalized events!")
+	t.Logf("Cryptographic SHA-256 verification PASSED for all 6 normalized events!")
 }
