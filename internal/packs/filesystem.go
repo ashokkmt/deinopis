@@ -7,6 +7,8 @@ import (
 	"strings"
 )
 
+const neutralStateDir = ".pack-state"
+
 // RejectSymlinks keeps managed pack state anchored beneath its configured root.
 func RejectSymlinks(root, target string) error {
 	root, err := filepath.Abs(root)

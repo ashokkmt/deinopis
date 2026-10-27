@@ -51,12 +51,6 @@ func init() {
 }
 
 func main() {
-	for _, arg := range os.Args[1:] {
-		if strings.HasPrefix(arg, "--marketplace-online") || strings.HasPrefix(arg, "--marketplace-url") {
-			fmt.Fprintln(os.Stderr, "unsupported option: marketplace access is not part of DEINOPIS")
-			os.Exit(2)
-		}
-	}
 	if len(os.Args) == 2 && (os.Args[1] == "-v" || os.Args[1] == "--version") {
 		fmt.Printf("DEINOPIS CLI Version: %s\n", Version)
 		return
@@ -126,9 +120,6 @@ func main() {
 			}
 			cli.ListSourcesCLI(":9090", srcDir)
 			return
-		case "marketplace", "-marketplace", "--marketplace":
-			fmt.Fprintln(os.Stderr, "unsupported command: marketplace distribution has been removed")
-			os.Exit(2)
 		case "sinks", "-sinks", "--sinks":
 			sinkDir := "sinks"
 			for i, a := range os.Args {
@@ -283,6 +274,11 @@ func main() {
 		case "replay-all", "-replay-all", "--replay-all":
 			cli.ReplayAllCLI(":9090")
 			return
+		default:
+			if !strings.HasPrefix(cmd, "-") {
+				fmt.Fprintf(os.Stderr, "unsupported command: %s\n", cmd)
+				os.Exit(2)
+			}
 		}
 	}
 

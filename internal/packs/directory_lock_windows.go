@@ -16,47 +16,26 @@ type DirectoryLock struct {
 }
 
 func AcquireDirectoryLock(dir string) (*DirectoryLock, error) {
-	legacyDir := filepath.Join(dir, legacyStateDir)
-	legacyExists := false
-	if _, err := os.Stat(legacyDir); err == nil {
-		legacyExists = true
-	} else if !os.IsNotExist(err) {
+	path := filepath.Join(dir, neutralStateDir, "owner.lock")
+	if err := RejectSymlinks(dir, path); err != nil {
 		return nil, err
-	}
-	paths := []string{filepath.Join(dir, neutralStateDir, "owner.lock")}
-	if legacyExists {
-		paths = append([]string{filepath.Join(legacyDir, "owner.lock")}, paths...)
-	}
-	for _, path := range paths {
-		if err := RejectSymlinks(dir, path); err != nil {
-			return nil, err
-		}
 	}
 	l := &DirectoryLock{}
-	for _, path := range paths {
-		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-			_ = l.Close()
-			return nil, err
-		}
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-		if err != nil {
-			_ = l.Close()
-			return nil, err
-		}
-		var overlapped windows.Overlapped
-		flags := uint32(windows.LOCKFILE_EXCLUSIVE_LOCK | windows.LOCKFILE_FAIL_IMMEDIATELY)
-		if err = windows.LockFileEx(windows.Handle(f.Fd()), flags, 0, 1, 0, &overlapped); err != nil {
-			_ = f.Close()
-			_ = l.Close()
-			return nil, fmt.Errorf("parser packs directory is already in use: %w", err)
-		}
-		l.files = append(l.files, f)
-		l.overlapped = append(l.overlapped, overlapped)
-	}
-	if err := migrateLegacyState(dir); err != nil {
-		_ = l.Close()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	var overlapped windows.Overlapped
+	flags := uint32(windows.LOCKFILE_EXCLUSIVE_LOCK | windows.LOCKFILE_FAIL_IMMEDIATELY)
+	if err = windows.LockFileEx(windows.Handle(f.Fd()), flags, 0, 1, 0, &overlapped); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("parser packs directory is already in use: %w", err)
+	}
+	l.files = append(l.files, f)
+	l.overlapped = append(l.overlapped, overlapped)
 	return l, nil
 }
 

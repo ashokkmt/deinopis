@@ -116,10 +116,6 @@ func TestAPI_HealthAndStats(t *testing.T) {
 	if health["status"] != "ok" || health["version"] != "test-version" {
 		t.Fatalf("invalid health response: %+v", health)
 	}
-	if _, ok := health["marketplace_online"]; ok {
-		t.Fatal("health response exposes removed marketplace state")
-	}
-
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -570,16 +566,13 @@ func TestAPI_AdminTokenAuth_BA023(t *testing.T) {
 	}
 }
 
-func TestRemovedAPIContractsReturnJSON404(t *testing.T) {
+func TestUnknownAPIContractsReturnJSON404(t *testing.T) {
 	srv, store, pipe, _ := setupTestServer(t)
 	defer store.Close()
 	pipe.Stop()
 	for _, tc := range []struct{ method, path string }{
-		{http.MethodGet, "/api/v1/marketplace/packs"},
-		{http.MethodPost, "/api/v1/marketplace/refresh"},
-		{http.MethodPost, "/api/v1/packs/install"},
-		{http.MethodPost, "/api/v1/packs/upgrade"},
-		{http.MethodDelete, "/api/v1/packs/example"},
+		{http.MethodGet, "/api/v1/unknown-resource"},
+		{http.MethodPost, "/api/v1/unknown-action"},
 	} {
 		w := httptest.NewRecorder()
 		srv.Handler().ServeHTTP(w, httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{"name":"example"}`)))

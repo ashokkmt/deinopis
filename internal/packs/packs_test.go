@@ -1,7 +1,6 @@
 package packs
 
 import (
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -266,99 +265,8 @@ func TestDirectoryLockUsesNeutralStateOnFreshPacksDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lock.Close()
-	if _, err := os.Stat(filepath.Join(dir, ".marketplace")); !os.IsNotExist(err) {
-		t.Fatalf("fresh parser lock created legacy state: %v", err)
-	}
 	if _, err := os.Stat(filepath.Join(dir, ".pack-state", "owner.lock")); err != nil {
 		t.Fatalf("neutral parser lock missing: %v", err)
-	}
-}
-
-func TestDirectoryLockMigratesLegacyParserStateAndRecoversTransaction(t *testing.T) {
-	dir := t.TempDir()
-	legacy := filepath.Join(dir, ".marketplace")
-	if err := os.MkdirAll(legacy, 0700); err != nil {
-		t.Fatal(err)
-	}
-	before := []byte("previous pack bytes")
-	if err := os.WriteFile(filepath.Join(dir, "custom.yml"), []byte("partial bytes"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	manifest, err := json.Marshal(PackManifest{Version: 1, Entries: map[string]PackInstall{}, History: map[string][]PackRevision{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	undo, err := json.Marshal(rollbackRecord{Filename: "custom.yml", Existed: true, Content: []byte("rollback bytes")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	transaction, err := json.Marshal(transactionRecord{
-		Before:        rollbackRecord{Filename: "custom.yml", Existed: true, Content: before},
-		Undo:          rollbackRecord{Filename: "custom.yml"},
-		PriorUndo:     undo,
-		PriorManifest: manifest,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for name, data := range map[string][]byte{"manifest.json": manifest, "rollback.json": undo, "transaction.json": transaction} {
-		if err := os.WriteFile(filepath.Join(legacy, name), data, 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	lock, err := AcquireDirectoryLock(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = lock.Close(); err != nil {
-		t.Fatal(err)
-	}
-	got, err := os.ReadFile(filepath.Join(dir, "custom.yml"))
-	if err != nil || string(got) != string(before) {
-		t.Fatalf("recovered pack = %q, err %v; want %q", got, err, before)
-	}
-	if _, err = os.Stat(transactionPath(dir)); !os.IsNotExist(err) {
-		t.Fatalf("completed transaction remains in neutral state: %v", err)
-	}
-	for _, name := range []string{"manifest.json", "rollback.json", "transaction.json"} {
-		if _, err = os.Stat(filepath.Join(legacy, name)); err != nil {
-			t.Fatalf("legacy backup %s missing: %v", name, err)
-		}
-	}
-	if _, err = os.Stat(filepath.Join(dir, ".pack-state", migrationFile)); err != nil {
-		t.Fatalf("migration completion record missing: %v", err)
-	}
-	newUndo := []byte(`{"filename":"custom.yml","existed":true,"content":"bmV3ZXIgcm9sbGJhY2sgYnl0ZXM="}`)
-	if err = atomicWrite(rollbackPath(dir), newUndo, 0600); err != nil {
-		t.Fatal(err)
-	}
-	lock, err = AcquireDirectoryLock(dir)
-	if err != nil {
-		t.Fatalf("repeat migration was not idempotent: %v", err)
-	}
-	_ = lock.Close()
-	got, err = readUndo(dir)
-	if err != nil || string(got) != string(newUndo) {
-		t.Fatalf("repeat startup replaced neutral rollback history: %s, err %v", got, err)
-	}
-}
-
-func TestDirectoryLockRejectsConflictingParserState(t *testing.T) {
-	dir := t.TempDir()
-	for _, stateDir := range []string{".marketplace", ".pack-state"} {
-		if err := os.MkdirAll(filepath.Join(dir, stateDir), 0700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, stateDir := range []string{".marketplace", ".pack-state"} {
-		if err := os.WriteFile(filepath.Join(dir, stateDir, "manifest.json"), []byte(`{"version":1,"entries":{},"history":{}}`), 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if lock, err := AcquireDirectoryLock(dir); err == nil {
-		_ = lock.Close()
-		t.Fatal("conflicting parser state was silently selected")
 	}
 }
 

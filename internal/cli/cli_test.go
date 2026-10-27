@@ -23,11 +23,6 @@ func TestDaemonStartupBanner(t *testing.T) {
 					t.Errorf("daemon startup banner missing %q:\n%s", want, got)
 				}
 			}
-			for _, retired := range []string{"marketplace", "registry"} {
-				if strings.Contains(strings.ToLower(got), retired) {
-					t.Errorf("daemon startup banner contains retired term %q", retired)
-				}
-			}
 		})
 	}
 }

@@ -12,45 +12,22 @@ import (
 type DirectoryLock struct{ files []*os.File }
 
 func AcquireDirectoryLock(dir string) (*DirectoryLock, error) {
-	legacyDir := filepath.Join(dir, legacyStateDir)
-	legacyExists := false
-	if _, err := os.Stat(legacyDir); err == nil {
-		legacyExists = true
-	} else if !os.IsNotExist(err) {
+	path := filepath.Join(dir, neutralStateDir, "owner.lock")
+	if err := RejectSymlinks(dir, path); err != nil {
 		return nil, err
 	}
-	paths := []string{filepath.Join(dir, neutralStateDir, "owner.lock")}
-	if legacyExists {
-		paths = append([]string{filepath.Join(legacyDir, "owner.lock")}, paths...)
-	}
-	for _, path := range paths {
-		if err := RejectSymlinks(dir, path); err != nil {
-			return nil, err
-		}
-	}
-	var files []*os.File
-	for _, path := range paths {
-		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-			closeFiles(files)
-			return nil, err
-		}
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-		if err != nil {
-			closeFiles(files)
-			return nil, err
-		}
-		if err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-			_ = f.Close()
-			closeFiles(files)
-			return nil, fmt.Errorf("parser packs directory is already in use: %w", err)
-		}
-		files = append(files, f)
-	}
-	if err := migrateLegacyState(dir); err != nil {
-		closeFiles(files)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
-	return &DirectoryLock{files: files}, nil
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("parser packs directory is already in use: %w", err)
+	}
+	return &DirectoryLock{files: []*os.File{f}}, nil
 }
 
 func (l *DirectoryLock) Close() error {
