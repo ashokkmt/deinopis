@@ -9,11 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"deinopis/internal/integrity"
 	"deinopis/internal/model"
 
 	_ "modernc.org/sqlite"
@@ -21,9 +23,10 @@ import (
 
 // RawStore provides durable, cryptographically verified storage for raw byte streams.
 type RawStore struct {
-	db      *sql.DB
-	writeMu sync.Mutex
-	counter atomic.Uint64
+	db       *sql.DB
+	writeMu  sync.Mutex
+	uploadMu sync.Mutex
+	counter  atomic.Uint64
 }
 
 // New opens an SQLite database, creates required tables and enables WAL mode.
@@ -54,12 +57,16 @@ func New(dbPath string) (*RawStore, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := ensureVaultStream(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 
 	return &RawStore{db: db}, nil
 }
 
 // CurrentSchemaVersion tracks the active database schema migration version.
-const CurrentSchemaVersion = 4
+const CurrentSchemaVersion = 5
 
 func initSchema(db *sql.DB) error {
 	tx, err := db.Begin()
@@ -77,6 +84,9 @@ func migrateSchema(db sqlExecutor) error {
 	var version int
 	if err := db.QueryRow("PRAGMA user_version;").Scan(&version); err != nil {
 		return fmt.Errorf("failed to read user_version: %w", err)
+	}
+	if version > CurrentSchemaVersion {
+		return fmt.Errorf("database schema version %d is newer than supported version %d", version, CurrentSchemaVersion)
 	}
 
 	if version < 1 {
@@ -173,6 +183,60 @@ func migrateSchema(db sqlExecutor) error {
 		version = 4
 	}
 
+	if version < 5 {
+		vaultSchema := `
+		CREATE TABLE IF NOT EXISTS vault_streams (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			stream_id TEXT NOT NULL UNIQUE,
+			epoch_start INTEGER NOT NULL,
+			window_seconds INTEGER NOT NULL CHECK (window_seconds = 300),
+			next_sequence INTEGER NOT NULL CHECK (next_sequence > 0),
+			last_sealed_slot INTEGER NOT NULL DEFAULT -1,
+			last_commitment BLOB NOT NULL CHECK (length(last_commitment) = 32)
+		);
+		CREATE TABLE IF NOT EXISTS vault_members (
+			stream_id TEXT NOT NULL REFERENCES vault_streams(stream_id),
+			accept_seq INTEGER NOT NULL CHECK (accept_seq > 0),
+			raw_id TEXT NOT NULL UNIQUE REFERENCES raw_events(raw_id) ON DELETE RESTRICT,
+			slot INTEGER NOT NULL CHECK (slot >= 0),
+			accepted_at_ns INTEGER NOT NULL CHECK (accepted_at_ns >= 0),
+			entry_bytes INTEGER NOT NULL CHECK (entry_bytes > 0),
+			PRIMARY KEY (stream_id, accept_seq)
+		);
+		CREATE INDEX IF NOT EXISTS idx_vault_members_window ON vault_members(stream_id, slot, accept_seq);
+		CREATE TABLE IF NOT EXISTS vault_windows (
+			stream_id TEXT NOT NULL REFERENCES vault_streams(stream_id),
+			slot INTEGER NOT NULL CHECK (slot >= 0),
+			coverage INTEGER NOT NULL CHECK (coverage BETWEEN 0 AND 2),
+			entry_count INTEGER NOT NULL CHECK (entry_count >= 0),
+			high_water_sequence INTEGER NOT NULL CHECK (high_water_sequence >= 0),
+			manifest BLOB NOT NULL,
+			manifest_digest BLOB NOT NULL CHECK (length(manifest_digest) = 32),
+			merkle_root BLOB NOT NULL CHECK (length(merkle_root) = 32),
+			previous_commitment BLOB NOT NULL CHECK (length(previous_commitment) = 32),
+			commitment BLOB NOT NULL CHECK (length(commitment) = 32),
+			sealed_at_ns INTEGER NOT NULL,
+			PRIMARY KEY (stream_id, slot)
+		);
+		CREATE TABLE IF NOT EXISTS vault_uploads (
+			stream_id TEXT NOT NULL,
+			slot INTEGER NOT NULL,
+			state TEXT NOT NULL CHECK(state IN ('pending','uploaded')),
+			attempts INTEGER NOT NULL DEFAULT 0,
+			retry_at_ns INTEGER NOT NULL,
+			last_error TEXT,
+			witness_receipt TEXT,
+			PRIMARY KEY(stream_id,slot),
+			FOREIGN KEY(stream_id,slot) REFERENCES vault_windows(stream_id,slot)
+		);
+		CREATE INDEX IF NOT EXISTS idx_vault_uploads_pending ON vault_uploads(state,retry_at_ns);
+		`
+		if _, err := db.Exec(vaultSchema); err != nil {
+			return fmt.Errorf("failed to create vault membership schema: %w", err)
+		}
+		version = 5
+	}
+
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d;", CurrentSchemaVersion)); err != nil {
 		return fmt.Errorf("failed to set user_version: %w", err)
 	}
@@ -196,18 +260,30 @@ func (s *RawStore) Store(ctx context.Context, rec model.IngestedRecord) (*model.
 
 	hash := sha256.Sum256(rec.RawBytes)
 	shaHex := hex.EncodeToString(hash[:])
+	acceptedAt := time.Now().UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin raw acceptance transaction: %w", err)
+	}
+	defer tx.Rollback()
+	if err = s.sealDueWindowsTx(ctx, tx, acceptedAt); err != nil {
+		return nil, fmt.Errorf("close elapsed evidence windows: %w", err)
+	}
 	if rec.Transport == "file" && rec.Metadata.FileID != "" {
 		var existingID, existingHash string
-		err := s.db.QueryRowContext(ctx, `SELECT raw_id, raw_sha256 FROM raw_events
+		err = tx.QueryRowContext(ctx, `SELECT raw_id, raw_sha256 FROM raw_events
 			WHERE json_extract(metadata_json, '$.file_id')=? AND COALESCE(json_extract(metadata_json, '$.file_offset'),0)=?
 			LIMIT 1`, rec.Metadata.FileID, rec.Metadata.FileOffset).Scan(&existingID, &existingHash)
 		if err == nil {
 			if existingHash != shaHex {
 				return nil, fmt.Errorf("file spool identity %s at offset %d was already committed with different bytes", rec.Metadata.FileID, rec.Metadata.FileOffset)
 			}
-			event, err := s.Retrieve(ctx, existingID)
-			if err != nil {
+			if err = tx.Rollback(); err != nil {
 				return nil, err
+			}
+			event, retrieveErr := s.Retrieve(ctx, existingID)
+			if retrieveErr != nil {
+				return nil, retrieveErr
 			}
 			event.Duplicate = true
 			return event, nil
@@ -216,11 +292,32 @@ func (s *RawStore) Store(ctx context.Context, rec model.IngestedRecord) (*model.
 			return nil, fmt.Errorf("check file spool replay identity: %w", err)
 		}
 	}
-
-	// Format monotonic, predictable raw ID: deinopis-raw-YYYYMMDD-<seq>-<rand>
+	var streamID string
+	var epoch, windowSeconds int64
+	var sequence uint64
+	if err = tx.QueryRowContext(ctx, "SELECT stream_id,epoch_start,window_seconds,next_sequence FROM vault_streams WHERE id=1").Scan(&streamID, &epoch, &windowSeconds, &sequence); err != nil {
+		return nil, err
+	}
+	if windowSeconds != vaultWindowSeconds || acceptedAt.Unix() < epoch {
+		return nil, errors.New("raw acceptance is outside the enrolled vault schedule")
+	}
+	slot := (acceptedAt.Unix() - epoch) / windowSeconds
+	var sealed int
+	if err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM vault_windows WHERE stream_id=? AND slot=?", streamID, slot).Scan(&sealed); err != nil {
+		return nil, err
+	}
+	if sealed != 0 {
+		return nil, errors.New("raw acceptance arrived after its vault window was sealed")
+	}
+	if sequence == 0 || sequence >= math.MaxInt64 {
+		return nil, errors.New("vault acceptance sequence exhausted")
+	}
+	// The process-local counter is only an ID suffix; durable order is next_sequence.
 	seq := s.counter.Add(1)
 	var randBytes [4]byte
-	_, _ = rand.Read(randBytes[:])
+	if _, err = rand.Read(randBytes[:]); err != nil {
+		return nil, fmt.Errorf("create raw ID entropy: %w", err)
+	}
 	rawID := fmt.Sprintf("deinopis-raw-%s-%06d-%x", rec.ReceivedAt.Format("20060102"), seq, randBytes)
 
 	event := &model.RawEvent{
@@ -235,6 +332,28 @@ func (s *RawStore) Store(ctx context.Context, rec model.IngestedRecord) (*model.
 		Payload:    rec.RawBytes,
 		Status:     model.StatusAccepted,
 	}
+	if rec.SourcePort < 0 || rec.SourcePort > math.MaxUint16 {
+		return nil, errors.New("source port is outside the integrity encoding range")
+	}
+	streamBytes, err := hex.DecodeString(streamID)
+	if err != nil || len(streamBytes) != 32 {
+		return nil, errors.New("stored vault stream ID is invalid")
+	}
+	var streamDigest integrity.Digest
+	copy(streamDigest[:], streamBytes)
+	encodedEntry, err := integrity.EncodeEntry(integrity.Entry{StreamID: streamDigest, Slot: uint64(slot), AcceptSeq: sequence, AcceptedAt: acceptedAt.UnixNano(), RawID: rawID, ReceivedAt: rec.ReceivedAt.UnixNano(), Transport: rec.Transport, SourceIP: rec.SourceIP, SourcePort: uint16(rec.SourcePort), Metadata: rec.Metadata, Payload: rec.RawBytes})
+	if err != nil {
+		return nil, fmt.Errorf("raw record is outside the vault contract: %w", err)
+	}
+	var windowCount int
+	var windowBytes int64
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(entry_bytes+4),0) FROM vault_members WHERE stream_id=? AND slot=?`, streamID, slot).Scan(&windowCount, &windowBytes); err != nil {
+		return nil, err
+	}
+	const manifestHeaderBytes = int64(len("DEINOPIS-MANIFEST-V1") + 2 + 32 + 8 + 8 + 8 + 1 + 8 + 32 + 32)
+	if windowCount >= maxWindowMembers || windowBytes+int64(len(encodedEntry))+4+manifestHeaderBytes > maxWindowBytes {
+		return nil, errors.New("vault window member or manifest limit reached; raw acceptance refused")
+	}
 
 	metadataJSON, err := json.Marshal(event.Metadata)
 	if err != nil {
@@ -244,7 +363,7 @@ func (s *RawStore) Store(ctx context.Context, rec model.IngestedRecord) (*model.
 	INSERT INTO raw_events (raw_id, raw_sha256, byte_count, transport, source_ip, source_port, metadata_json, received_at, payload, status)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
-	_, err = s.db.ExecContext(ctx, query,
+	if _, err = tx.ExecContext(ctx, query,
 		event.RawID,
 		event.RawSHA256,
 		event.ByteCount,
@@ -255,9 +374,17 @@ func (s *RawStore) Store(ctx context.Context, rec model.IngestedRecord) (*model.
 		event.ReceivedAt.Format(time.RFC3339Nano),
 		event.Payload,
 		string(event.Status),
-	)
-	if err != nil {
+	); err != nil {
 		return nil, fmt.Errorf("failed to persist raw record %s: %w", rawID, err)
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO vault_members(stream_id,accept_seq,raw_id,slot,accepted_at_ns,entry_bytes) VALUES(?,?,?,?,?,?)`, streamID, sequence, rawID, slot, acceptedAt.UnixNano(), len(encodedEntry)); err != nil {
+		return nil, fmt.Errorf("failed to persist vault membership for %s: %w", rawID, err)
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE vault_streams SET next_sequence=? WHERE id=1", sequence+1); err != nil {
+		return nil, fmt.Errorf("failed to advance vault sequence: %w", err)
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit raw acceptance and membership: %w", err)
 	}
 
 	return event, nil
