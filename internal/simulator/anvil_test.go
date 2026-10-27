@@ -94,3 +94,65 @@ func TestStartDeploysRegistryAndStopsOwnedAnvil(t *testing.T) {
 		t.Fatalf("remove second test-owned run directory: %v", err)
 	}
 }
+
+func TestSyntheticDemoVerifiesAndLocalizesDeletion(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	demo := NewDemo()
+	defer demo.Close()
+	run, err := demo.Start(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Mode != "SIMULATED" || run.Records != 13 || len(run.Batches) != 4 {
+		t.Fatalf("unexpected demo summary: %+v", run)
+	}
+	countBatches, ageBatches := 0, 0
+	for _, batch := range run.Batches {
+		if batch.CloseReason == "count" {
+			countBatches++
+		}
+		if batch.CloseReason == "age" {
+			ageBatches++
+		}
+	}
+	if countBatches != 3 || ageBatches != 1 {
+		t.Fatalf("count/age batches=%d/%d", countBatches, ageBatches)
+	}
+	clean, err := demo.Verify(ctx, run.RunID)
+	if err != nil || clean.Content != "INTACT" || clean.RecordsChecked != 13 || clean.Coverage != "complete" {
+		t.Fatalf("clean verify=%+v err=%v", clean, err)
+	}
+	if err = demo.TamperDelete(ctx, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := demo.Verify(ctx, run.RunID)
+	if err != nil || changed.Content != "TAMPERED" {
+		t.Fatalf("tampered verify=%+v err=%v", changed, err)
+	}
+	found := false
+	for _, issue := range changed.Issues {
+		if issue.Sequence == 6 && issue.Reason == "accepted raw parent or membership is missing" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("deletion was not localized to sequence 6: %+v", changed.Issues)
+	}
+	if err = demo.TamperDeleteTail(ctx, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	tail, err := demo.Verify(ctx, run.RunID)
+	if err != nil || tail.Content != "TAMPERED" {
+		t.Fatalf("tail deletion verify=%+v err=%v", tail, err)
+	}
+	found = false
+	for _, issue := range tail.Issues {
+		if issue.Sequence == 13 && issue.Reason == "accepted raw parent or membership is missing" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("registry-backed tail deletion was not localized to sequence 13: %+v", tail.Issues)
+	}
+}

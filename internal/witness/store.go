@@ -287,6 +287,58 @@ type BatchReceipt struct {
 	Existing      bool
 }
 
+// StoredBatch is an immutable first-write manifest returned for scoped verification.
+type StoredBatch struct {
+	BatchNo       uint64
+	FirstSequence uint64
+	LastSequence  uint64
+	Count         uint64
+	Digest        integrity.Digest
+	Commitment    integrity.Digest
+	ReceivedAt    time.Time
+	Manifest      []byte
+}
+
+// ReadBatchManifests returns the original stored bytes in batch order, validating the
+// database index against each immutable manifest before exposing it to a verifier.
+func (s *Store) ReadBatchManifests(ctx context.Context, streamID string) ([]StoredBatch, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT batch_no,first_sequence,high_water_sequence,record_count,digest,commitment,path,received_at_ns FROM batches WHERE stream_id=? ORDER BY batch_no`, streamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var batches []StoredBatch
+	for rows.Next() {
+		var item StoredBatch
+		var digest, commitment []byte
+		var name string
+		var received int64
+		if err = rows.Scan(&item.BatchNo, &item.FirstSequence, &item.LastSequence, &item.Count, &digest, &commitment, &name, &received); err != nil {
+			return nil, err
+		}
+		if len(digest) != 32 || len(commitment) != 32 || filepath.Base(name) != name {
+			return nil, errors.New("invalid stored witness batch index")
+		}
+		copy(item.Digest[:], digest)
+		copy(item.Commitment[:], commitment)
+		item.ReceivedAt = time.Unix(0, received).UTC()
+		item.Manifest, err = os.ReadFile(filepath.Join(s.dir, name))
+		if err != nil {
+			return nil, fmt.Errorf("read original witness batch %d: %w", item.BatchNo, err)
+		}
+		parsed, parseErr := integrity.ParseBatchManifest(item.Manifest)
+		actual := integrity.ManifestDigest(item.Manifest)
+		if parseErr != nil || actual != item.Digest || parsed.BatchNo != item.BatchNo || parsed.FirstSequence != item.FirstSequence || parsed.LastSequence != item.LastSequence || parsed.Count != item.Count || parsed.Commitment != item.Commitment || hex.EncodeToString(parsed.StreamID[:]) != streamID {
+			return nil, fmt.Errorf("stored witness batch %d failed immutable index validation", item.BatchNo)
+		}
+		batches = append(batches, item)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return batches, nil
+}
+
 type PublicationQueueStatus struct {
 	StreamID     string            `json:"stream_id"`
 	NextBatch    uint64            `json:"next_batch"`

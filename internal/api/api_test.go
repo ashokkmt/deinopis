@@ -144,6 +144,26 @@ func TestAPI_HealthAndStats(t *testing.T) {
 	}
 }
 
+func TestIntegrityDemoMutationsRequireConfiguredAdmin(t *testing.T) {
+	srv := api.NewServer("127.0.0.1:0", nil, nil, nil, "", api.ConfigInfo{AdminToken: "synthetic-admin"}, fstest.MapFS{"index.html": {Data: []byte("ui")}}, "test")
+	handler := srv.Handler()
+	for _, path := range []string{"/api/v1/integrity/demo", "/api/v1/integrity/demo/run/verify", "/api/v1/integrity/demo/run/tamper", "/api/v1/integrity/demo/run/tamper-tail"} {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		if res.Code != http.StatusUnauthorized {
+			t.Errorf("POST %s without admin token returned %d, want 401", path, res.Code)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/integrity/demo", nil)
+	req.Header.Set("Authorization", "Bearer synthetic-admin")
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	if res.Code != http.StatusServiceUnavailable {
+		t.Fatalf("explicit demo request without an attached simulator returned %d, want 503", res.Code)
+	}
+}
+
 func TestAPI_EventsAndTrace(t *testing.T) {
 	srv, store, pipe, tempDir := setupTestServer(t)
 	defer os.RemoveAll(tempDir)

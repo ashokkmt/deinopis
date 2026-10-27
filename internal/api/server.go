@@ -26,6 +26,7 @@ import (
 	"deinopis/internal/packs"
 	"deinopis/internal/pipeline"
 	"deinopis/internal/rawstore"
+	"deinopis/internal/simulator"
 	"gopkg.in/yaml.v3"
 )
 
@@ -61,6 +62,7 @@ type Server struct {
 	distFS        fs.FS
 	startTime     time.Time
 	ingestTracker IngestTracker
+	integrityDemo *simulator.Demo
 
 	statsMu      sync.Mutex
 	lastAccepted int64
@@ -113,6 +115,9 @@ func (s *Server) SetConnManager(mgr *connections.Manager, dir string) {
 	s.connManager = mgr
 	s.connsDir = dir
 }
+
+// SetIntegrityDemo attaches the explicit, disposable synthetic integrity workflow.
+func (s *Server) SetIntegrityDemo(demo *simulator.Demo) { s.integrityDemo = demo }
 
 func (s *Server) requireAdminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -188,6 +193,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/connections/apply", s.requireAdminAuth(s.handleApplyConnection))
 	mux.HandleFunc("POST /api/v1/connections/rollback", s.requireAdminAuth(s.handleRollbackConnection))
 	mux.HandleFunc("GET /api/v1/config", s.handleConfig)
+	mux.HandleFunc("POST /api/v1/integrity/demo", s.requireConfiguredAdminAuth(s.handleIntegrityDemoStart))
+	mux.HandleFunc("POST /api/v1/integrity/demo/{run}/verify", s.requireConfiguredAdminAuth(s.handleIntegrityDemoVerify))
+	mux.HandleFunc("POST /api/v1/integrity/demo/{run}/tamper", s.requireConfiguredAdminAuth(s.handleIntegrityDemoTamper))
+	mux.HandleFunc("POST /api/v1/integrity/demo/{run}/tamper-tail", s.requireConfiguredAdminAuth(s.handleIntegrityDemoTamperTail))
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		s.jsonError(w, http.StatusNotFound, "API route not found")
 	})
@@ -229,7 +238,14 @@ func (s *Server) Start() error {
 // Stop gracefully shuts down the management server.
 func (s *Server) Stop(ctx context.Context) error {
 	if s.httpServer != nil {
-		return s.httpServer.Shutdown(ctx)
+		err := s.httpServer.Shutdown(ctx)
+		if s.integrityDemo != nil {
+			s.integrityDemo.Close()
+		}
+		return err
+	}
+	if s.integrityDemo != nil {
+		s.integrityDemo.Close()
 	}
 	return nil
 }

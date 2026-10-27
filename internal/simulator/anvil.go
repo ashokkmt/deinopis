@@ -2,6 +2,7 @@ package simulator
 
 import (
 	"context"
+	"crypto/ecdsa"
 	crand "crypto/rand"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"deinopis/internal/chain/registry"
+	"deinopis/internal/integrity"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -36,10 +38,14 @@ type Runner struct {
 	RegistryHash common.Hash
 	PID          int
 
-	client *ethclient.Client
-	cancel context.CancelFunc
-	done   chan error
-	once   sync.Once
+	client   *ethclient.Client
+	key      *ecdsa.PrivateKey
+	contract *registry.BatchRegistry
+	streams  map[integrity.Digest]bool
+	txMu     sync.Mutex
+	cancel   context.CancelFunc
+	done     chan error
+	once     sync.Once
 }
 
 // Start launches an empty Anvil chain, deploys the real registry binding and verifies its empty head.
@@ -112,6 +118,9 @@ func (r *Runner) Stop() {
 		if r.client != nil {
 			r.client.Close()
 		}
+		if r.key != nil && r.key.D != nil {
+			r.key.D.SetInt64(0)
+		}
 		if r.cancel != nil {
 			r.cancel()
 		}
@@ -129,7 +138,7 @@ func (r *Runner) deployRegistry(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("generate ephemeral simulator key: %w", err)
 	}
-	defer func() { key.D.SetInt64(0) }()
+	r.key = key
 	address := crypto.PubkeyToAddress(key.PublicKey)
 	rpcClient, err := rpc.DialContext(ctx, r.RPCURL)
 	if err != nil {
@@ -182,6 +191,8 @@ func (r *Runner) deployRegistry(ctx context.Context) error {
 	}
 	r.Registry = contractAddress
 	r.RegistryHash = crypto.Keccak256Hash(code)
+	r.contract = contract
+	r.streams = make(map[integrity.Digest]bool)
 	return nil
 }
 

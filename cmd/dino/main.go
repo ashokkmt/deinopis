@@ -28,6 +28,7 @@ import (
 	"deinopis/internal/packs"
 	"deinopis/internal/pipeline"
 	"deinopis/internal/rawstore"
+	"deinopis/internal/simulator"
 	"deinopis/internal/witness"
 	"deinopis/web"
 )
@@ -598,6 +599,7 @@ func main() {
 		uiServer = api.NewServer(*uiAddr, store, p, packManager, *packsDir, cfgInfo, web.Dist(), Version)
 		uiServer.SetIngestTracker(mgr)
 		uiServer.SetConnManager(connMgr, *sinksDir)
+		uiServer.SetIntegrityDemo(simulator.NewDemo())
 		if err := uiServer.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "WARNING: Failed to start Management UI on %s: %v\n", *uiAddr, err)
 		} else {

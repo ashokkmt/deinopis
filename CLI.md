@@ -88,6 +88,8 @@ The witness rejects retired `DEINOPIS_CHAIN_*`, `DEINOPIS_REGISTRY_*`, and `DEIN
 
 For an explicit local contract smoke run, start `dino-sim`. It creates a fresh temporary run directory, starts Anvil on loopback with a random local chain ID, deploys the registry, verifies its empty history, and prints the run metadata. Press Ctrl-C to stop only that Anvil child process. Artifacts remain in the printed run directory. This is **SIMULATED** local behavior, not production publication, independent custody, or public-chain finality.
 
+For the full synthetic workflow, start `dino` with its management UI and a configured admin token, open the Dashboard, and use **Start synthetic run** followed by **Verify**. The run generates deterministic auth, web, and app logs in separate temporary collector and witness stores, publishes batch commitments to its own loopback Anvil chain, and reports local witness receipts and registry readback. **Delete one synthetic record** and **Delete synthetic tail batch** are demo-only controls for that temporary run. All these results are **SIMULATED**; the routes require the configured admin token and accept no normal database/path selector.
+
 ## Security and operations
 
 Management, HTTP ingestion, and plaintext Syslog defaults bind to loopback. Configure intake and management authentication before exposing listeners. Store credentials in private environment variables or secret files, not in checked-in YAML or command history. Source and sink adapters keep their own configured network behavior; parser provisioning does not disable them.

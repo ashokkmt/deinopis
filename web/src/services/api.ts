@@ -7,6 +7,31 @@ import { ConnectionSummary, ConnectionValidationResponse, ConnectionTestResponse
 const BASE_URL = '/api/v1';
 let adminToken = '';
 
+export interface IntegrityDemoRun {
+  mode: string;
+  run_id: string;
+  stream_id: string;
+  generator_version: string;
+  seed: number;
+  records: number;
+  fixture_digests: Record<string, string>;
+  batches: Array<{ batch_no: number; first_sequence: number; last_sequence: number; records: number; close_reason: string; witness_receipt: string; anchor: { transaction_hash: string; local_block: number; commitment: string } }>;
+  chain_id: string;
+  registry: string;
+  registry_code_hash: string;
+}
+
+export interface IntegrityDemoCheck {
+  mode: string;
+  content: string;
+  witness: string;
+  anchor: string;
+  coverage: string;
+  records_checked: number;
+  batches_checked: number;
+  issues: Array<{ sequence?: number; batch_no?: number; raw_id?: string; reason: string }>;
+}
+
 export function setAdminToken(token: string): void {
   adminToken = token;
 }
@@ -54,6 +79,10 @@ export const apiService = {
   setAdminToken,
   getHealth: () => fetchJSON<HealthStatus>('/health'),
   getStats: () => fetchJSON<SystemStats>('/stats'),
+  startIntegrityDemo: () => fetchJSON<IntegrityDemoRun>('/integrity/demo', { method: 'POST' }),
+  verifyIntegrityDemo: (runId: string) => fetchJSON<IntegrityDemoCheck>(`/integrity/demo/${encodeURIComponent(runId)}/verify`, { method: 'POST' }),
+  tamperIntegrityDemo: (runId: string) => fetchJSON<{ mode: string; status: string; scope: string }>(`/integrity/demo/${encodeURIComponent(runId)}/tamper`, { method: 'POST' }),
+  tamperIntegrityDemoTail: (runId: string) => fetchJSON<{ mode: string; status: string; scope: string }>(`/integrity/demo/${encodeURIComponent(runId)}/tamper-tail`, { method: 'POST' }),
   
   listEvents: (params?: { category?: string; severity?: string; q?: string; limit?: number; offset?: number }) => {
     const q = new URLSearchParams();

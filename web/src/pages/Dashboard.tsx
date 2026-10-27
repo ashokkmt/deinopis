@@ -1,11 +1,12 @@
 import React, { useEffect, useState } from 'react';
-import { Activity, Server, Cpu, Clock, RefreshCw, AlertTriangle, ArrowRight } from 'lucide-react';
+import { Activity, Server, Cpu, Clock, RefreshCw, AlertTriangle, ArrowRight, Play, ShieldCheck, Trash2 } from 'lucide-react';
 import { MetricCard } from '../components/MetricCard';
 import { LossLedger } from '../components/LossLedger';
 import { Badge } from '../components/Badge';
 import { SystemStats } from '../types/telemetry';
 import { SourceSummary } from '../types/event';
 import { apiService } from '../services/api';
+import { IntegrityDemoCheck, IntegrityDemoRun } from '../services/api';
 
 interface DashboardProps {
   onNavigate: (tab: string, param?: string) => void;
@@ -18,6 +19,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate, stats: propSta
   const [sources, setSources] = useState<SourceSummary[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
+  const [demoRun, setDemoRun] = useState<IntegrityDemoRun | null>(null);
+  const [demoCheck, setDemoCheck] = useState<IntegrityDemoCheck | null>(null);
+  const [demoBusy, setDemoBusy] = useState(false);
+  const [demoNotice, setDemoNotice] = useState('');
+  const [demoError, setDemoError] = useState('');
 
   const stats = propStats !== undefined ? propStats : internalStats;
 
@@ -81,6 +87,37 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate, stats: propSta
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
+  const runIntegrityDemo = async () => {
+    setDemoBusy(true); setDemoError(''); setDemoNotice('Starting a disposable synthetic run…'); setDemoCheck(null);
+    try { const run = await apiService.startIntegrityDemo(); setDemoRun(run); setDemoNotice('Synthetic run ready. Choose Verify to check its snapshot.'); }
+    catch (error) { setDemoError(error instanceof Error ? error.message : 'Could not start synthetic run'); setDemoNotice(''); }
+    finally { setDemoBusy(false); }
+  };
+
+  const verifyIntegrityDemo = async () => {
+    if (!demoRun) return;
+    setDemoBusy(true); setDemoError(''); setDemoNotice('Verifying frozen synthetic snapshot…');
+    try { setDemoCheck(await apiService.verifyIntegrityDemo(demoRun.run_id)); setDemoNotice('Verification finished. Results are local simulation evidence.'); }
+    catch (error) { setDemoError(error instanceof Error ? error.message : 'Could not verify synthetic run'); setDemoNotice(''); }
+    finally { setDemoBusy(false); }
+  };
+
+  const tamperIntegrityDemo = async () => {
+    if (!demoRun) return;
+    setDemoBusy(true); setDemoError(''); setDemoNotice('Deleting one synthetic parent from the disposable demo store…');
+    try { const result = await apiService.tamperIntegrityDemo(demoRun.run_id); setDemoNotice(result.status); setDemoCheck(null); }
+    catch (error) { setDemoError(error instanceof Error ? error.message : 'Could not modify synthetic run'); setDemoNotice(''); }
+    finally { setDemoBusy(false); }
+  };
+
+  const tamperIntegrityDemoTail = async () => {
+    if (!demoRun) return;
+    setDemoBusy(true); setDemoError(''); setDemoNotice('Deleting the synthetic tail batch from the disposable demo store…');
+    try { const result = await apiService.tamperIntegrityDemoTail(demoRun.run_id); setDemoNotice(result.status); setDemoCheck(null); }
+    catch (error) { setDemoError(error instanceof Error ? error.message : 'Could not delete synthetic tail batch'); setDemoNotice(''); }
+    finally { setDemoBusy(false); }
+  };
+
   return (
     <div className="space-y-6">
       {/* Top Header */}
@@ -106,6 +143,33 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate, stats: propSta
           </button>
         </div>
       </div>
+
+      <section aria-labelledby="integrity-demo-heading" className="bg-[#161b22] border border-[#30363d] rounded-lg p-4 sm:p-5 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+          <div>
+            <h2 id="integrity-demo-heading" className="text-sm font-mono font-bold text-[#f0f6fc] flex items-center gap-2"><ShieldCheck className="w-4 h-4 text-emerald-400" /> Simulated Integrity Demo</h2>
+            <p className="text-xs text-[#8b949e] mt-1 max-w-3xl">Uses 13 deterministic synthetic logs, an isolated collector, a same-host witness simulation, and a disposable loopback Anvil registry. It never reads this collector’s data.</p>
+          </div>
+          <span className="text-xs font-mono rounded border border-amber-700/60 bg-amber-950/30 text-amber-300 px-2 py-1 shrink-0">SIMULATED · no public finality</span>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <button type="button" onClick={runIntegrityDemo} disabled={demoBusy} className="inline-flex items-center gap-2 rounded bg-[#238636] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><Play className="w-3.5 h-3.5" />Start synthetic run</button>
+          <button type="button" onClick={verifyIntegrityDemo} disabled={demoBusy || !demoRun} className="inline-flex items-center gap-2 rounded bg-[#1f6feb] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><ShieldCheck className="w-3.5 h-3.5" />Verify</button>
+          <button type="button" onClick={tamperIntegrityDemo} disabled={demoBusy || !demoRun} className="inline-flex items-center gap-2 rounded bg-[#6e3a21] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><Trash2 className="w-3.5 h-3.5" />Delete one synthetic record</button>
+          <button type="button" onClick={tamperIntegrityDemoTail} disabled={demoBusy || !demoRun} className="inline-flex items-center gap-2 rounded bg-[#6e3a21] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><Trash2 className="w-3.5 h-3.5" />Delete synthetic tail batch</button>
+        </div>
+        <p role="status" aria-live="polite" className="text-xs text-[#8b949e]">{demoNotice}</p>
+        {demoError && <p role="alert" className="text-xs text-red-400">{demoError}</p>}
+        {demoRun && <div className="text-xs font-mono text-[#8b949e] space-y-1">
+          <p>Run {demoRun.run_id} · seed {demoRun.seed} · {demoRun.records} records · chain {demoRun.chain_id} · local registry {demoRun.registry}</p>
+          <p>{demoRun.batches.map((batch) => `batch ${batch.batch_no}: seq ${batch.first_sequence}–${batch.last_sequence}, ${batch.close_reason} flush, local block ${batch.anchor.local_block}`).join(' · ')}</p>
+        </div>}
+        {demoCheck && <div className="border-t border-[#30363d] pt-3 space-y-2">
+          <p className={`text-sm font-mono font-semibold ${demoCheck.content === 'INTACT' ? 'text-emerald-400' : demoCheck.content === 'TAMPERED' ? 'text-red-400' : 'text-amber-300'}`}>Content: {demoCheck.content} · coverage: {demoCheck.coverage}</p>
+          <p className="text-xs text-[#8b949e]">{demoCheck.records_checked} records checked · {demoCheck.batches_checked} witness batches · witness: {demoCheck.witness} · anchor: {demoCheck.anchor} (local readback only)</p>
+          {demoCheck.issues.length > 0 && <ul className="list-disc pl-5 text-xs text-red-300 space-y-1">{demoCheck.issues.map((issue, index) => <li key={`${issue.sequence ?? issue.raw_id ?? 'issue'}-${index}`}>{issue.sequence ? `Sequence ${issue.sequence}, batch ${issue.batch_no}: ` : ''}{issue.reason}</li>)}</ul>}
+        </div>}
+      </section>
 
       {/* KPI Metric Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
