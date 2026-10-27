@@ -6,9 +6,7 @@ data/
 *.db-wal
 *.db-shm
 dist/
-marketplace-site/
 vendor/
-packs/.marketplace/
 .secrets/
 WORKLOG.md
 AGENTS.md
