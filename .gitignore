@@ -1,0 +1,15 @@
+plans/
+graphify-out/
+bin/
+data/
+*.db
+*.db-wal
+*.db-shm
+dist/
+marketplace-site/
+vendor/
+packs/.marketplace/
+.secrets/
+WORKLOG.md
+AGENTS.md
+.megaignore
