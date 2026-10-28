@@ -66,31 +66,50 @@ func TestEndToEnd_ReplayAndPacks(t *testing.T) {
 	}
 	pipe.ConnectIngest(ctx, mgr.Channel())
 
-	// Copy all files from testdata/replay to inbox
+	// Copy the baseline and initially unmatched samples into the watched inbox.
 	replayDir := filepath.Join(root, "testdata", "replay")
-	entries, err := os.ReadDir(replayDir)
-	if err != nil {
-		t.Fatalf("failed to read testdata/replay: %v", err)
-	}
-
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(replayDir, e.Name()))
+	for _, group := range []string{"initial", "unmatched"} {
+		groupDir := filepath.Join(replayDir, group)
+		entries, err := os.ReadDir(groupDir)
 		if err != nil {
-			t.Fatalf("failed to read %s: %v", e.Name(), err)
+			t.Fatalf("failed to read replay fixture directory %s: %v", groupDir, err)
 		}
-		dest := filepath.Join(inboxDir, e.Name())
-		if err := os.WriteFile(dest, data, 0644); err != nil {
-			t.Fatalf("failed to write %s: %v", dest, err)
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(groupDir, e.Name()))
+			if err != nil {
+				t.Fatalf("failed to read fixture %s: %v", e.Name(), err)
+			}
+			dest := filepath.Join(inboxDir, e.Name())
+			if err := os.WriteFile(dest, data, 0644); err != nil {
+				t.Fatalf("failed to stage fixture %s: %v", dest, err)
+			}
 		}
 	}
 
-	// Allow file watcher to ingest and workers to process
-	time.Sleep(800 * time.Millisecond)
+	// Wait for the watcher and workers to process the complete fixture set.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, quarantined, err := store.ListQuarantinePaged(ctx, 10, 0)
+		if err != nil {
+			t.Fatalf("ListQuarantinePaged failed while waiting for ingestion: %v", err)
+		}
+		_, normalized, err := store.ListNormalized(ctx, "", "", "", 50, 0)
+		if err != nil {
+			t.Fatalf("ListNormalized failed while waiting for ingestion: %v", err)
+		}
+		if quarantined == 5 && normalized == 16 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for fixture ingestion: got %d quarantined and %d normalized, want 5 and 16", quarantined, normalized)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
-	// Check quarantine count: exactly 3 logs must be quarantined (2 order-service, 1 edge-waf)
+	// Two order-service NDJSON records plus three other unmatched records quarantine.
 	qEntries, qTotal, err := store.ListQuarantinePaged(ctx, 10, 0)
 	if err != nil {
 		t.Fatalf("ListQuarantinePaged failed: %v", err)
@@ -98,23 +117,23 @@ func TestEndToEnd_ReplayAndPacks(t *testing.T) {
 	for _, q := range qEntries {
 		t.Logf("  * Quarantine ID: %s | Stage: %s | Reason: %s | Preview: %s", q.QuarantineID, q.Stage, q.Reason, q.RawPreview)
 	}
-	if qTotal != 3 {
-		t.Fatalf("expected 3 quarantined entries, got %d", qTotal)
+	if qTotal != 5 {
+		t.Fatalf("expected 5 quarantined entries, got %d", qTotal)
 	}
-	t.Logf("Successfully verified 3 quarantined entries:")
+	t.Logf("Successfully verified 5 quarantined entries:")
 	for _, q := range qEntries {
 		t.Logf("  * Quarantine ID: %s | Stage: %s | Reason: %s", q.QuarantineID, q.Stage, q.Reason)
 	}
 
-	// The three retained fixtures outside the two deliberately unknown sources normalize initially.
+	// Every one of the 16 baseline pack samples should normalize before corrections.
 	_, normTotal, err := store.ListNormalized(ctx, "", "", "", 50, 0)
 	if err != nil {
 		t.Fatalf("ListNormalized failed: %v", err)
 	}
-	if normTotal != 3 {
-		t.Fatalf("expected 3 normalized entries initially, got %d", normTotal)
+	if normTotal != 16 {
+		t.Fatalf("expected 16 normalized entries initially, got %d", normTotal)
 	}
-	t.Logf("Successfully verified 3 normalized entries initially")
+	t.Logf("Successfully verified 16 normalized entries initially")
 
 	tempPacksDir := filepath.Join(tempDir, "packs")
 	_ = os.MkdirAll(tempPacksDir, 0755)
@@ -140,46 +159,42 @@ func TestEndToEnd_ReplayAndPacks(t *testing.T) {
 	)
 	handler := srv.Handler()
 
-	// 1. Activate Pack 1: app-order-service.yaml
-	orderPackYAML, err := os.ReadFile(filepath.Join(replayDir, "packs", "app-order-service.yaml"))
+	// Activate every correction pack while leaving quarantine pending until replay-all.
+	correctionDir := filepath.Join(replayDir, "packs")
+	correctionPacks, err := os.ReadDir(correctionDir)
 	if err != nil {
-		t.Fatalf("failed to read app-order-service.yaml: %v", err)
+		t.Fatalf("failed to read correction packs: %v", err)
 	}
-	actOrderBody, _ := json.Marshal(map[string]string{
-		"yaml_content": string(orderPackYAML),
-		"filename":     "app-order-service.yaml",
-	})
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/packs/activate", bytes.NewReader(actOrderBody))
+	for _, packFile := range correctionPacks {
+		if packFile.IsDir() || !strings.HasSuffix(strings.ToLower(packFile.Name()), ".yaml") {
+			continue
+		}
+		packPath := filepath.Join(correctionDir, packFile.Name())
+		packYAML, err := os.ReadFile(packPath)
+		if err != nil {
+			t.Fatalf("failed to read correction pack %s: %v", packPath, err)
+		}
+		body, err := json.Marshal(map[string]string{
+			"yaml_content": string(packYAML),
+			"filename":     packFile.Name(),
+		})
+		if err != nil {
+			t.Fatalf("failed to encode correction pack %s: %v", packPath, err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/packs/activate", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer integration-token")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("activate pack %s failed with %d: %s", packFile.Name(), rec.Code, rec.Body.String())
+		}
+		t.Logf("Activated correction pack: %s", packFile.Name())
+	}
+
+	// Trigger global replay after all correction packs are active.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/quarantine/replay-all", nil)
 	req.Header.Set("Authorization", "Bearer integration-token")
 	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("activate pack 1 failed with %d: %s", rec.Code, rec.Body.String())
-	}
-	t.Logf("Activated pack 1: app-order-service")
-
-	// 2. Activate Pack 2: edge-waf.yaml
-	wafPackYAML, err := os.ReadFile(filepath.Join(replayDir, "packs", "edge-waf.yaml"))
-	if err != nil {
-		t.Fatalf("failed to read edge-waf.yaml: %v", err)
-	}
-	actWafBody, _ := json.Marshal(map[string]string{
-		"yaml_content": string(wafPackYAML),
-		"filename":     "edge-waf.yaml",
-	})
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/packs/activate", bytes.NewReader(actWafBody))
-	req.Header.Set("Authorization", "Bearer integration-token")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("activate pack 2 failed with %d: %s", rec.Code, rec.Body.String())
-	}
-	t.Logf("Activated pack 2: edge-waf")
-
-	// 3. Trigger Global Replay All
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/quarantine/replay-all", nil)
-	req.Header.Set("Authorization", "Bearer integration-token")
-	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("replay-all failed with %d: %s", rec.Code, rec.Body.String())
@@ -193,18 +208,18 @@ func TestEndToEnd_ReplayAndPacks(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&replayResp); err != nil {
 		t.Fatalf("failed to decode replay-all response: %v", err)
 	}
-	if replayResp.Total != 3 || replayResp.Replayed != 3 || replayResp.Failed != 0 {
-		t.Fatalf("expected 3/3 replayed, got %+v", replayResp)
+	if replayResp.Total != 5 || replayResp.Replayed != 5 || replayResp.Failed != 0 {
+		t.Fatalf("expected 5/5 replayed, got %+v", replayResp)
 	}
 	t.Logf("Replay All executed successfully: %+v", replayResp)
 
-	// 4. Verify that all six records represented by the current synthetic replay fixtures are normalized.
+	// Verify all original and replayed records are now normalized.
 	normEvents, normTotal, err := store.ListNormalized(ctx, "", "", "", 50, 0)
 	if err != nil {
 		t.Fatalf("ListNormalized failed: %v", err)
 	}
-	if normTotal != 6 {
-		t.Fatalf("expected 6 total normalized events after replay, got %d", normTotal)
+	if normTotal != 21 {
+		t.Fatalf("expected 21 total normalized events after replay, got %d", normTotal)
 	}
 
 	// 5. Verify Cryptographic Integrity of every normalized event
@@ -217,5 +232,5 @@ func TestEndToEnd_ReplayAndPacks(t *testing.T) {
 			t.Fatalf("integrity check FAILED for %s: %s", evt.Deinopis.EventID, rep.FailureReason)
 		}
 	}
-	t.Logf("Cryptographic SHA-256 verification PASSED for all 6 normalized events!")
+	t.Logf("Cryptographic SHA-256 verification PASSED for all 21 normalized events!")
 }
