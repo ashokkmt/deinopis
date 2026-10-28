@@ -23,6 +23,9 @@ export interface IntegrityDemoRun {
 
 export interface IntegrityDemoCheck {
   mode: string;
+  checked_at_utc: string;
+  first_adverse_at_utc?: string;
+  observation_count: number;
   content: string;
   witness: string;
   anchor: string;
@@ -81,6 +84,13 @@ export const apiService = {
   getStats: () => fetchJSON<SystemStats>('/stats'),
   startIntegrityDemo: () => fetchJSON<IntegrityDemoRun>('/integrity/demo', { method: 'POST' }),
   verifyIntegrityDemo: (runId: string) => fetchJSON<IntegrityDemoCheck>(`/integrity/demo/${encodeURIComponent(runId)}/verify`, { method: 'POST' }),
+  getIntegrityDemoEvidence: async (runId: string) => {
+    const res = await fetch(`${BASE_URL}/integrity/demo/${encodeURIComponent(runId)}/evidence`, {
+      headers: adminToken ? { Authorization: `Bearer ${adminToken}` } : {},
+    });
+    if (!res.ok) throw new Error(`Evidence export failed: HTTP ${res.status}`);
+    return res.blob();
+  },
   tamperIntegrityDemo: (runId: string) => fetchJSON<{ mode: string; status: string; scope: string }>(`/integrity/demo/${encodeURIComponent(runId)}/tamper`, { method: 'POST' }),
   tamperIntegrityDemoTail: (runId: string) => fetchJSON<{ mode: string; status: string; scope: string }>(`/integrity/demo/${encodeURIComponent(runId)}/tamper-tail`, { method: 'POST' }),
   

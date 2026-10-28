@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Activity, Server, Cpu, Clock, RefreshCw, AlertTriangle, ArrowRight, Play, ShieldCheck, Trash2 } from 'lucide-react';
+import { Activity, Server, Cpu, Clock, RefreshCw, AlertTriangle, ArrowRight, Play, ShieldCheck, Trash2, Download } from 'lucide-react';
 import { MetricCard } from '../components/MetricCard';
 import { LossLedger } from '../components/LossLedger';
 import { Badge } from '../components/Badge';
@@ -102,6 +102,23 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate, stats: propSta
     finally { setDemoBusy(false); }
   };
 
+  const exportIntegrityDemo = async () => {
+    if (!demoRun) return;
+    setDemoBusy(true); setDemoError('');
+    try {
+      const blob = await apiService.getIntegrityDemoEvidence(demoRun.run_id);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'deinopis-simulated-integrity-evidence.json';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) { setDemoError(error instanceof Error ? error.message : 'Could not export evidence'); }
+    finally { setDemoBusy(false); }
+  };
+
   const tamperIntegrityDemo = async () => {
     if (!demoRun) return;
     setDemoBusy(true); setDemoError(''); setDemoNotice('Deleting one synthetic parent from the disposable demo store…');
@@ -155,6 +172,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate, stats: propSta
         <div className="flex flex-wrap gap-2">
           <button type="button" onClick={runIntegrityDemo} disabled={demoBusy} className="inline-flex items-center gap-2 rounded bg-[#238636] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><Play className="w-3.5 h-3.5" />Start synthetic run</button>
           <button type="button" onClick={verifyIntegrityDemo} disabled={demoBusy || !demoRun} className="inline-flex items-center gap-2 rounded bg-[#1f6feb] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><ShieldCheck className="w-3.5 h-3.5" />Verify</button>
+          <button type="button" onClick={exportIntegrityDemo} disabled={demoBusy || !demoCheck} className="inline-flex items-center gap-2 rounded bg-[#30363d] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><Download className="w-3.5 h-3.5" />Export evidence</button>
           <button type="button" onClick={tamperIntegrityDemo} disabled={demoBusy || !demoRun} className="inline-flex items-center gap-2 rounded bg-[#6e3a21] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><Trash2 className="w-3.5 h-3.5" />Delete one synthetic record</button>
           <button type="button" onClick={tamperIntegrityDemoTail} disabled={demoBusy || !demoRun} className="inline-flex items-center gap-2 rounded bg-[#6e3a21] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><Trash2 className="w-3.5 h-3.5" />Delete synthetic tail batch</button>
         </div>
@@ -167,6 +185,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate, stats: propSta
         {demoCheck && <div className="border-t border-[#30363d] pt-3 space-y-2">
           <p className={`text-sm font-mono font-semibold ${demoCheck.content === 'INTACT' ? 'text-emerald-400' : demoCheck.content === 'TAMPERED' ? 'text-red-400' : 'text-amber-300'}`}>Content: {demoCheck.content} · coverage: {demoCheck.coverage}</p>
           <p className="text-xs text-[#8b949e]">{demoCheck.records_checked} records checked · {demoCheck.batches_checked} witness batches · witness: {demoCheck.witness} · anchor: {demoCheck.anchor} (local readback only)</p>
+          <p className="text-xs text-[#8b949e]">Checked {new Date(demoCheck.checked_at_utc).toLocaleString()} · {demoCheck.observation_count} persisted checks{demoCheck.first_adverse_at_utc ? ` · first adverse observation ${new Date(demoCheck.first_adverse_at_utc).toLocaleString()} (retained after recovery)` : ' · no adverse observation recorded'}</p>
           {demoCheck.issues.length > 0 && <ul className="list-disc pl-5 text-xs text-red-300 space-y-1">{demoCheck.issues.map((issue, index) => <li key={`${issue.sequence ?? issue.raw_id ?? 'issue'}-${index}`}>{issue.sequence ? `Sequence ${issue.sequence}, batch ${issue.batch_no}: ` : ''}{issue.reason}</li>)}</ul>}
         </div>}
       </section>

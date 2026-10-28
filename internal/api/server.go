@@ -195,6 +195,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/config", s.handleConfig)
 	mux.HandleFunc("POST /api/v1/integrity/demo", s.requireConfiguredAdminAuth(s.handleIntegrityDemoStart))
 	mux.HandleFunc("POST /api/v1/integrity/demo/{run}/verify", s.requireConfiguredAdminAuth(s.handleIntegrityDemoVerify))
+	mux.HandleFunc("GET /api/v1/integrity/demo/{run}/evidence", s.requireConfiguredAdminAuth(s.handleIntegrityDemoEvidence))
 	mux.HandleFunc("POST /api/v1/integrity/demo/{run}/tamper", s.requireConfiguredAdminAuth(s.handleIntegrityDemoTamper))
 	mux.HandleFunc("POST /api/v1/integrity/demo/{run}/tamper-tail", s.requireConfiguredAdminAuth(s.handleIntegrityDemoTamperTail))
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {

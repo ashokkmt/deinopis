@@ -42,6 +42,7 @@ type Runner struct {
 	key      *ecdsa.PrivateKey
 	contract *registry.BatchRegistry
 	streams  map[integrity.Digest]bool
+	pending  map[integrity.Digest]*types.Transaction
 	txMu     sync.Mutex
 	cancel   context.CancelFunc
 	done     chan error
@@ -50,11 +51,15 @@ type Runner struct {
 
 // Start launches an empty Anvil chain, deploys the real registry binding and verifies its empty head.
 func Start(ctx context.Context) (*Runner, error) {
+	return start(ctx, "")
+}
+
+func start(ctx context.Context, parentDir string) (*Runner, error) {
 	path, err := findAnvil()
 	if err != nil {
 		return nil, err
 	}
-	runDir, err := os.MkdirTemp("", "deinopis-sim-")
+	runDir, err := os.MkdirTemp(parentDir, "deinopis-sim-")
 	if err != nil {
 		return nil, fmt.Errorf("create simulator run directory: %w", err)
 	}
@@ -133,6 +138,62 @@ func (r *Runner) Stop() {
 	})
 }
 
+// Snapshot and Revert expose Anvil's local-only snapshot controls for deterministic reorg drills.
+func (r *Runner) Snapshot(ctx context.Context) (string, error) {
+	client, err := rpc.DialContext(ctx, r.RPCURL)
+	if err != nil {
+		return "", fmt.Errorf("connect to local simulator RPC: %w", err)
+	}
+	defer client.Close()
+	var id string
+	if err = client.CallContext(ctx, &id, "evm_snapshot"); err != nil {
+		return "", fmt.Errorf("create local simulator snapshot: %w", err)
+	}
+	return id, nil
+}
+
+func (r *Runner) Revert(ctx context.Context, id string) (bool, error) {
+	if id == "" {
+		return false, errors.New("local simulator snapshot ID is required")
+	}
+	client, err := rpc.DialContext(ctx, r.RPCURL)
+	if err != nil {
+		return false, fmt.Errorf("connect to local simulator RPC: %w", err)
+	}
+	defer client.Close()
+	var reverted bool
+	if err = client.CallContext(ctx, &reverted, "evm_revert", id); err != nil {
+		return false, fmt.Errorf("revert local simulator snapshot: %w", err)
+	}
+	return reverted, nil
+}
+
+func (r *Runner) VerifyIdentity(ctx context.Context, chainID, registryAddress, codeHash string) error {
+	if r == nil || r.client == nil {
+		return errors.New("simulator registry is not running")
+	}
+	actualChain, err := r.client.ChainID(ctx)
+	if err != nil {
+		return fmt.Errorf("read local simulator chain ID: %w", err)
+	}
+	expectedChain, ok := new(big.Int).SetString(chainID, 10)
+	if !ok || actualChain.Cmp(expectedChain) != 0 {
+		return errors.New("local simulator chain ID differs from the run record")
+	}
+	address := common.HexToAddress(registryAddress)
+	if !common.IsHexAddress(registryAddress) || address != r.Registry {
+		return errors.New("local simulator registry address differs from the run record")
+	}
+	code, err := r.client.CodeAt(ctx, address, nil)
+	if err != nil {
+		return fmt.Errorf("read local simulator registry code: %w", err)
+	}
+	if len(code) == 0 || crypto.Keccak256Hash(code).Hex() != codeHash || crypto.Keccak256Hash(code) != r.RegistryHash {
+		return errors.New("local simulator registry code hash differs from the run record")
+	}
+	return nil
+}
+
 func (r *Runner) deployRegistry(ctx context.Context) error {
 	key, err := crypto.GenerateKey()
 	if err != nil {
@@ -193,6 +254,7 @@ func (r *Runner) deployRegistry(ctx context.Context) error {
 	r.RegistryHash = crypto.Keccak256Hash(code)
 	r.contract = contract
 	r.streams = make(map[integrity.Digest]bool)
+	r.pending = make(map[integrity.Digest]*types.Transaction)
 	return nil
 }
 

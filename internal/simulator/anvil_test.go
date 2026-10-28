@@ -1,6 +1,7 @@
 package simulator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"math/big"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"deinopis/internal/witness"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
@@ -130,6 +132,9 @@ func TestSyntheticDemoVerifiesAndLocalizesDeletion(t *testing.T) {
 	if err != nil || changed.Content != "TAMPERED" {
 		t.Fatalf("tampered verify=%+v err=%v", changed, err)
 	}
+	if changed.FirstAdverseAt == nil || changed.Observations != 2 {
+		t.Fatalf("first adverse observation was not persisted: %+v", changed)
+	}
 	found := false
 	for _, issue := range changed.Issues {
 		if issue.Sequence == 6 && issue.Reason == "accepted raw parent or membership is missing" {
@@ -146,6 +151,24 @@ func TestSyntheticDemoVerifiesAndLocalizesDeletion(t *testing.T) {
 	if err != nil || tail.Content != "TAMPERED" {
 		t.Fatalf("tail deletion verify=%+v err=%v", tail, err)
 	}
+	if tail.FirstAdverseAt == nil || !tail.FirstAdverseAt.Equal(*changed.FirstAdverseAt) {
+		t.Fatalf("later failure moved first adverse observation: first=%v tail=%v", changed.FirstAdverseAt, tail.FirstAdverseAt)
+	}
+	demoRun, err := demo.getRun(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = demoRun.witness.Close(); err != nil {
+		t.Fatal(err)
+	}
+	demoRun.witness, err = witness.NewStore(demoRun.summary.WitnessPath, filepath.Join(demoRun.root, "witness-manifests"))
+	if err != nil {
+		t.Fatalf("reopen run-scoped witness: %v", err)
+	}
+	reopened, err := demo.Verify(ctx, run.RunID)
+	if err != nil || reopened.FirstAdverseAt == nil || !reopened.FirstAdverseAt.Equal(*changed.FirstAdverseAt) {
+		t.Fatalf("witness restart moved first adverse observation: result=%+v err=%v", reopened, err)
+	}
 	found = false
 	for _, issue := range tail.Issues {
 		if issue.Sequence == 13 && issue.Reason == "accepted raw parent or membership is missing" {
@@ -154,5 +177,9 @@ func TestSyntheticDemoVerifiesAndLocalizesDeletion(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("registry-backed tail deletion was not localized to sequence 13: %+v", tail.Issues)
+	}
+	evidence, err := demo.Evidence(run.RunID)
+	if err != nil || !json.Valid(evidence) || !bytes.Contains(evidence, []byte(`"first_adverse_at_utc"`)) {
+		t.Fatalf("completed synthetic evidence export unavailable: err=%v", err)
 	}
 }

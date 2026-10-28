@@ -11,7 +11,11 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,9 +42,11 @@ type DemoSummary struct {
 	Batches          []DemoBatch       `json:"batches"`
 	CollectorPath    string            `json:"collector_path"`
 	WitnessPath      string            `json:"witness_path"`
+	AnvilRunDir      string            `json:"anvil_run_directory"`
 	ChainID          string            `json:"chain_id"`
 	Registry         string            `json:"registry"`
 	RegistryCodeHash string            `json:"registry_code_hash"`
+	EvidencePath     string            `json:"evidence_path"`
 }
 
 type DemoBatch struct {
@@ -62,6 +68,9 @@ type VerificationIssue struct {
 
 type DemoVerification struct {
 	Mode           string              `json:"mode"`
+	CheckedAt      time.Time           `json:"checked_at_utc"`
+	FirstAdverseAt *time.Time          `json:"first_adverse_at_utc,omitempty"`
+	Observations   int                 `json:"observation_count"`
 	Content        string              `json:"content"`
 	Witness        string              `json:"witness"`
 	Anchor         string              `json:"anchor"`
@@ -72,13 +81,16 @@ type DemoVerification struct {
 }
 
 type demoRun struct {
-	summary  DemoSummary
-	store    *rawstore.RawStore
-	witness  *witness.Store
-	runner   *Runner
-	root     string
-	streamID string
-	mu       sync.Mutex
+	summary       DemoSummary
+	store         *rawstore.RawStore
+	witness       *witness.Store
+	runner        *Runner
+	root          string
+	streamID      string
+	fingerprint   string
+	token         string
+	chainSnapshot string
+	mu            sync.Mutex
 }
 
 // Demo owns one disposable collector, witness and local-chain run; it never opens product stores.
@@ -156,8 +168,13 @@ func (d *Demo) Start(ctx context.Context) (DemoSummary, error) {
 	if err = wit.EnrollBatch(ctx, streamID, fingerprintText, token); err != nil {
 		return DemoSummary{}, err
 	}
-	runner, err := Start(ctx)
+	runner, err := start(ctx, root)
 	if err != nil {
+		return DemoSummary{}, err
+	}
+	chainSnapshot, err := runner.Snapshot(ctx)
+	if err != nil {
+		runner.Stop()
 		return DemoSummary{}, err
 	}
 	failed := true
@@ -166,7 +183,7 @@ func (d *Demo) Start(ctx context.Context) (DemoSummary, error) {
 			runner.Stop()
 		}
 	}()
-	summary := DemoSummary{Mode: "SIMULATED", RunID: runID, StreamID: streamID, GeneratorVersion: demoGeneratorVersion, Seed: demoSeed, Records: 13, FixtureDigests: map[string]string{}, CollectorPath: filepath.Join(root, "collector.sqlite"), WitnessPath: filepath.Join(root, "witness.sqlite"), ChainID: runner.ChainID.String(), Registry: runner.Registry.Hex(), RegistryCodeHash: runner.RegistryHash.Hex()}
+	summary := DemoSummary{Mode: "SIMULATED", RunID: runID, StreamID: streamID, GeneratorVersion: demoGeneratorVersion, Seed: demoSeed, Records: 13, FixtureDigests: map[string]string{}, CollectorPath: filepath.Join(root, "collector.sqlite"), WitnessPath: filepath.Join(root, "witness.sqlite"), AnvilRunDir: runner.RunDir, ChainID: runner.ChainID.String(), Registry: runner.Registry.Hex(), RegistryCodeHash: runner.RegistryHash.Hex(), EvidencePath: filepath.Join(root, "qualification.json")}
 	rng := rand.New(rand.NewSource(demoSeed))
 	fixtureHashes := map[string]hashCollector{}
 	base := time.Now().UTC().Truncate(time.Second)
@@ -218,7 +235,7 @@ func (d *Demo) Start(ctx context.Context) (DemoSummary, error) {
 	closeStore = false
 	closeWitness = false
 	failed = false
-	d.run = &demoRun{summary: summary, store: store, witness: wit, runner: runner, root: root, streamID: streamID}
+	d.run = &demoRun{summary: summary, store: store, witness: wit, runner: runner, root: root, streamID: streamID, fingerprint: fingerprintText, token: token, chainSnapshot: chainSnapshot}
 	return summary, nil
 }
 
@@ -241,7 +258,118 @@ func (d *Demo) Verify(ctx context.Context, runID string) (DemoVerification, erro
 	}
 	run.mu.Lock()
 	defer run.mu.Unlock()
-	return run.verify(ctx)
+	result, err := run.verify(ctx)
+	if err != nil {
+		return result, err
+	}
+	result.CheckedAt = time.Now().UTC()
+	result.FirstAdverseAt, result.Observations, err = recordVerification(ctx, run.summary.WitnessPath, runID, result)
+	if err != nil {
+		return DemoVerification{}, fmt.Errorf("persist simulated verification observation: %w", err)
+	}
+	if err = run.writeEvidence(ctx, result); err != nil {
+		return DemoVerification{}, err
+	}
+	return result, nil
+}
+
+// Evidence returns only the JSON report produced by a completed synthetic verification.
+func (d *Demo) Evidence(runID string) ([]byte, error) {
+	run, err := d.getRun(runID)
+	if err != nil {
+		return nil, err
+	}
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	return os.ReadFile(run.summary.EvidencePath)
+}
+
+func (r *demoRun) writeEvidence(ctx context.Context, result DemoVerification) error {
+	history, err := r.runner.ReadHistory(ctx, r.streamID)
+	evidence := struct {
+		Mode              string            `json:"mode"`
+		GeneratedAt       string            `json:"generated_at_utc"`
+		GoVersion         string            `json:"go_version"`
+		GOOS              string            `json:"goos"`
+		GOARCH            string            `json:"goarch"`
+		Revision          string            `json:"source_revision,omitempty"`
+		Summary           DemoSummary       `json:"run"`
+		RegistryBatches   int               `json:"registry_batches"`
+		RegistryHead      string            `json:"registry_head"`
+		Verification      DemoVerification  `json:"verification"`
+		FirstAdverseAt    *time.Time        `json:"first_adverse_at_utc,omitempty"`
+		ObservationCount  int               `json:"observation_count"`
+		ManifestDigests   []string          `json:"witness_manifest_sha256"`
+		ArtifactChecksums map[string]string `json:"artifact_sha256"`
+		ToolVersions      map[string]string `json:"tool_versions"`
+		EvidenceNotes     []string          `json:"evidence_notes,omitempty"`
+		ClaimLimits       []string          `json:"claim_limits"`
+	}{Mode: "SIMULATED", GeneratedAt: time.Now().UTC().Format(time.RFC3339Nano), GoVersion: runtime.Version(), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, Summary: r.summary, RegistryBatches: len(history), Verification: result, FirstAdverseAt: result.FirstAdverseAt, ObservationCount: result.Observations, ArtifactChecksums: map[string]string{}, ToolVersions: map[string]string{}, ClaimLimits: []string{"local Anvil state is not public-chain finality", "same-host witness storage is not independent custody", "local measurements are not production capacity or gas/fee evidence", "each check uses one consistent local SQLite read transaction; no scheduled or resumable snapshot job is simulated"}}
+	if err != nil {
+		evidence.EvidenceNotes = append(evidence.EvidenceNotes, "local registry inventory unavailable: "+err.Error())
+	}
+	if build, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range build.Settings {
+			if setting.Key == "vcs.revision" {
+				evidence.Revision = setting.Value
+			}
+		}
+	}
+	if evidence.Revision == "" {
+		if output, revErr := exec.CommandContext(ctx, "git", "rev-parse", "HEAD").Output(); revErr == nil {
+			evidence.Revision = strings.TrimSpace(string(output))
+		}
+	}
+	if len(history) > 0 {
+		evidence.RegistryHead = fmt.Sprintf("0x%x", history[len(history)-1].Commitment)
+	}
+	manifests, manifestErr := r.witness.ReadBatchManifests(ctx, r.streamID)
+	if manifestErr != nil {
+		evidence.EvidenceNotes = append(evidence.EvidenceNotes, "witness manifest inventory unavailable: "+manifestErr.Error())
+	}
+	for _, batch := range manifests {
+		evidence.ManifestDigests = append(evidence.ManifestDigests, hex.EncodeToString(batch.Digest[:]))
+	}
+	for _, path := range []string{filepath.Join(r.root, "demo.json"), filepath.Join(r.runner.RunDir, "run.json"), r.summary.CollectorPath, r.summary.WitnessPath} {
+		sum, hashErr := fileSHA256(path)
+		if hashErr == nil {
+			evidence.ArtifactChecksums[filepath.Base(path)] = sum
+		}
+	}
+	if path, findErr := findAnvil(); findErr == nil {
+		evidence.ToolVersions["anvil"] = commandVersion(ctx, path)
+	} else {
+		evidence.EvidenceNotes = append(evidence.EvidenceNotes, "Anvil version unavailable: "+findErr.Error())
+	}
+	if path, findErr := exec.LookPath("forge"); findErr == nil {
+		evidence.ToolVersions["forge"] = commandVersion(ctx, path)
+	} else {
+		evidence.EvidenceNotes = append(evidence.EvidenceNotes, "Foundry forge version unavailable: "+findErr.Error())
+	}
+	body, err := json.MarshalIndent(evidence, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(r.summary.EvidencePath, append(body, '\n'), 0600)
+}
+
+func commandVersion(ctx context.Context, path string) string {
+	versionCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	body, err := exec.CommandContext(versionCtx, path, "--version").CombinedOutput()
+	if err != nil {
+		return "unavailable: " + err.Error()
+	}
+	return strings.TrimSpace(string(body))
+}
+
+func fileSHA256(path string) (string, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // TamperDelete removes one accepted raw parent only from the disposable demo store.
@@ -341,6 +469,39 @@ func (d *Demo) TamperDeleteTail(ctx context.Context, runID string) error {
 	return tx.Commit()
 }
 
+// appendRecovery adds a new, separately sequenced synthetic record after a simulated loss.
+func (r *demoRun) appendRecovery(ctx context.Context, lostSequence uint64) error {
+	payload := []byte(fmt.Sprintf("SIMULATED recovery record for missing sequence %d", lostSequence))
+	_, err := r.store.Store(ctx, model.IngestedRecord{Transport: "simulator", SourceIP: "127.0.0.1", RawBytes: payload, ReceivedAt: time.Now().UTC(), Metadata: model.ReceiveMetadata{Listener: "synthetic-recovery", RequestID: fmt.Sprintf("recovery-%d", lostSequence)}})
+	if err != nil {
+		return err
+	}
+	flushAt := time.Now().UTC().Add(6 * time.Minute)
+	if err = r.store.SealDueVaultBatches(ctx, flushAt); err != nil {
+		return err
+	}
+	batchNo := r.summary.Batches[len(r.summary.Batches)-1].BatchNo + 1
+	batch, err := r.store.SealedBatch(ctx, batchNo)
+	if err != nil {
+		return err
+	}
+	receipt, err := r.witness.AcceptBatch(ctx, r.streamID, batchNo, hex.EncodeToString(batch.Digest[:]), r.fingerprint, r.token, batch.Manifest, flushAt)
+	if err != nil {
+		return err
+	}
+	anchor, err := r.runner.PublishBatch(ctx, batch)
+	if err != nil {
+		return err
+	}
+	r.summary.Batches = append(r.summary.Batches, DemoBatch{BatchNo: batchNo, FirstSequence: batch.FirstSequence, LastSequence: batch.LastSequence, Records: batch.EntryCount, CloseReason: batch.CloseReason, WitnessReceipt: fmt.Sprintf("local witness receipt %s", hex.EncodeToString(receipt.Digest[:])), Anchor: anchor})
+	r.summary.Records++
+	body, err := json.MarshalIndent(r.summary, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(r.root, "demo.json"), append(body, '\n'), 0600)
+}
+
 func (d *Demo) getRun(id string) (*demoRun, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -364,6 +525,11 @@ func (r *demoRun) close() { _ = r.store.Close(); _ = r.witness.Close(); r.runner
 
 func (r *demoRun) verify(ctx context.Context) (DemoVerification, error) {
 	result := DemoVerification{Mode: "SIMULATED", Content: "UNKNOWN", Witness: "first-write originals", Anchor: "local registry readback", Coverage: "incomplete", Issues: []VerificationIssue{}}
+	if err := r.runner.VerifyIdentity(ctx, r.summary.ChainID, r.summary.Registry, r.summary.RegistryCodeHash); err != nil {
+		result.Anchor = "identity mismatch"
+		result.Issues = append(result.Issues, VerificationIssue{Reason: "simulated chain or registry identity differs from the run record: " + err.Error()})
+		return result, nil
+	}
 	manifests, err := r.witness.ReadBatchManifests(ctx, r.streamID)
 	if err != nil {
 		result.Witness = "unavailable"

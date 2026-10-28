@@ -14,6 +14,14 @@ The management config response no longer returns the configured admin token; raw
 
 For a local-only native run, keep the defaults or explicitly use `-http 127.0.0.1:8080 -ui 127.0.0.1:9090` and disable unused Syslog listeners with `-syslog-udp none -syslog-tcp none -syslog-tls none`. Restrict database and file permissions; avoid putting credentials in shell history or checked-in YAML. Source/sink manifests should use `secretRef` and private environment/file secrets. Treat hash verification as a local consistency check, not proof against someone who can replace both data and stored hashes.
 
+## Integrity simulation boundary
+
+The integrity demo is an isolated development feature. It accepts synthetic records only, creates run-specific temporary collector and witness stores, and starts its own Anvil process bound to loopback with ephemeral local chain state. Normal `dino`/`dino-witness` startup does not launch Anvil, connect to a public RPC, or load simulator state. The demo API routes require the configured admin token; the browser token is entered in the Configuration page and is kept in the current tab.
+
+The Dashboard tamper controls can delete records only from that synthetic run. A completed check can export a JSON evidence report with run/scope metadata, local registry/witness references, checksums, and verification history; raw event payloads are excluded. The report is still operational metadata and should be handled accordingly. First-adverse observations persist in the run-scoped witness database and are not cleared by retry or restoring synthetic bytes, but that database is on the same host and shares its administrator boundary.
+
+The simulation demonstrates code paths and the user workflow. It is not an independent witness, trusted snapshot service, production scheduler, public-chain publisher, finality proof, machine-wide attestation, or production tamper-protection claim. The production blockchain deployment remains design-only. Never use the synthetic controls as a repair or reset mechanism for real collector or witness data.
+
 ## Parser configuration safety
 
 DEINOPIS provisions reviewed local YAML parsers in native, container, and air-gap packages. Review parser provenance and synthetic fixtures before activation. Parser YAML is declarative and does not execute extensions. Local activation retains strict validation, path containment, symlink rejection, expected-digest conflict checks, transactional writes, and rollback.

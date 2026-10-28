@@ -37,6 +37,26 @@ func (s *Server) handleIntegrityDemoVerify(w http.ResponseWriter, r *http.Reques
 	s.jsonResponse(w, http.StatusOK, result)
 }
 
+func (s *Server) handleIntegrityDemoEvidence(w http.ResponseWriter, r *http.Request) {
+	if s.integrityDemo == nil {
+		s.jsonError(w, http.StatusServiceUnavailable, "simulated integrity workflow is unavailable")
+		return
+	}
+	body, err := s.integrityDemo.Evidence(r.PathValue("run"))
+	if errors.Is(err, simulator.ErrRunNotFound) {
+		s.jsonError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	if err != nil {
+		s.jsonError(w, http.StatusConflict, "no completed verification evidence is available")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", `attachment; filename="deinopis-simulated-integrity-evidence.json"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
 func (s *Server) handleIntegrityDemoTamper(w http.ResponseWriter, r *http.Request) {
 	if s.integrityDemo == nil {
 		s.jsonError(w, http.StatusServiceUnavailable, "simulated integrity workflow is unavailable")

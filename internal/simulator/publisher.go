@@ -11,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
@@ -34,19 +35,35 @@ func (r *Runner) PublishBatch(ctx context.Context, batch rawstore.SealedBatch) (
 	}
 	stream := common.HexToHash("0x" + batch.StreamID)
 	if !r.streams[parsed.StreamID] {
-		auth, err := bind.NewKeyedTransactorWithChainID(r.key, r.ChainID)
-		if err != nil {
-			return LocalAnchor{}, err
+		publisher, readErr := r.contract.PublisherOf(&bind.CallOpts{Context: ctx}, stream)
+		if readErr != nil {
+			return LocalAnchor{}, fmt.Errorf("reconcile local demo stream registration: %w", readErr)
 		}
-		auth.Context = ctx
-		tx, err := r.contract.RegisterStream(auth, stream, auth.From)
-		if err != nil {
-			return LocalAnchor{}, fmt.Errorf("register local demo stream: %w", err)
-		}
-		if _, err = successfulReceipt(ctx, r.client, tx); err != nil {
-			return LocalAnchor{}, err
+		if publisher == (common.Address{}) {
+			auth, err := bind.NewKeyedTransactorWithChainID(r.key, r.ChainID)
+			if err != nil {
+				return LocalAnchor{}, err
+			}
+			auth.Context = ctx
+			tx, err := r.contract.RegisterStream(auth, stream, auth.From)
+			if err != nil {
+				return LocalAnchor{}, fmt.Errorf("register local demo stream: %w", err)
+			}
+			if _, err = successfulReceipt(ctx, r.client, tx); err != nil {
+				return LocalAnchor{}, err
+			}
+		} else if publisher != crypto.PubkeyToAddress(r.key.PublicKey) {
+			return LocalAnchor{}, errors.New("local demo stream is registered to another publisher")
 		}
 		r.streams[parsed.StreamID] = true
+	}
+	if tx := r.pending[parsed.Commitment]; tx != nil {
+		receipt, err := successfulReceipt(ctx, r.client, tx)
+		if err != nil {
+			return LocalAnchor{}, err
+		}
+		delete(r.pending, parsed.Commitment)
+		return localAnchor(batch.BatchNo, parsed.Commitment, tx, receipt), nil
 	}
 	auth, err := bind.NewKeyedTransactorWithChainID(r.key, r.ChainID)
 	if err != nil {
@@ -57,11 +74,17 @@ func (r *Runner) PublishBatch(ctx context.Context, batch rawstore.SealedBatch) (
 	if err != nil {
 		return LocalAnchor{}, fmt.Errorf("append batch to local registry: %w", err)
 	}
+	r.pending[parsed.Commitment] = tx
 	receipt, err := successfulReceipt(ctx, r.client, tx)
 	if err != nil {
 		return LocalAnchor{}, err
 	}
-	return LocalAnchor{BatchNo: batch.BatchNo, Transaction: tx.Hash().Hex(), Block: receipt.BlockNumber.Uint64(), Commitment: hex.EncodeToString(parsed.Commitment[:])}, nil
+	delete(r.pending, parsed.Commitment)
+	return localAnchor(batch.BatchNo, parsed.Commitment, tx, receipt), nil
+}
+
+func localAnchor(batchNo uint64, commitment [32]byte, tx *types.Transaction, receipt *types.Receipt) LocalAnchor {
+	return LocalAnchor{BatchNo: batchNo, Transaction: tx.Hash().Hex(), Block: receipt.BlockNumber.Uint64(), Commitment: hex.EncodeToString(commitment[:])}
 }
 
 func (r *Runner) ReadHistory(ctx context.Context, streamID string) ([]registryEntry, error) {

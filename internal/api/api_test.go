@@ -19,6 +19,7 @@ import (
 	"deinopis/internal/packs"
 	"deinopis/internal/pipeline"
 	"deinopis/internal/rawstore"
+	"deinopis/internal/simulator"
 )
 
 func setupTestServer(t *testing.T) (*api.Server, *rawstore.RawStore, *pipeline.Pipeline, string) {
@@ -155,12 +156,50 @@ func TestIntegrityDemoMutationsRequireConfiguredAdmin(t *testing.T) {
 			t.Errorf("POST %s without admin token returned %d, want 401", path, res.Code)
 		}
 	}
+	getEvidence := httptest.NewRequest(http.MethodGet, "/api/v1/integrity/demo/run/evidence", nil)
+	getEvidenceResult := httptest.NewRecorder()
+	handler.ServeHTTP(getEvidenceResult, getEvidence)
+	if getEvidenceResult.Code != http.StatusUnauthorized {
+		t.Fatalf("GET evidence without admin token returned %d, want 401", getEvidenceResult.Code)
+	}
+	getEvidence = httptest.NewRequest(http.MethodGet, "/api/v1/integrity/demo/run/evidence", nil)
+	getEvidence.Header.Set("Authorization", "Bearer synthetic-admin")
+	getEvidenceResult = httptest.NewRecorder()
+	handler.ServeHTTP(getEvidenceResult, getEvidence)
+	if getEvidenceResult.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET evidence without an attached simulator returned %d, want 503", getEvidenceResult.Code)
+	}
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/integrity/demo", nil)
 	req.Header.Set("Authorization", "Bearer synthetic-admin")
 	res := httptest.NewRecorder()
 	handler.ServeHTTP(res, req)
 	if res.Code != http.StatusServiceUnavailable {
 		t.Fatalf("explicit demo request without an attached simulator returned %d, want 503", res.Code)
+	}
+}
+
+func TestIntegrityDemoEvidenceExportReturnsCompletedSyntheticReport(t *testing.T) {
+	t.Setenv("DEINOPIS_ADMIN_TOKEN", "test-admin-token")
+	srv, store, pipe, tempDir := setupTestServer(t)
+	defer os.RemoveAll(tempDir)
+	defer store.Close()
+	defer pipe.Stop()
+	demo := simulator.NewDemo()
+	defer demo.Close()
+	srv.SetIntegrityDemo(demo)
+	run, err := demo.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = demo.Verify(context.Background(), run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/integrity/demo/"+run.RunID+"/evidence", nil)
+	req.Header.Set("Authorization", "Bearer test-admin-token")
+	res := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(res, req)
+	if res.Code != http.StatusOK || res.Header().Get("Content-Type") != "application/json" || !strings.Contains(res.Header().Get("Content-Disposition"), "attachment") || !json.Valid(res.Body.Bytes()) {
+		t.Fatalf("evidence export response status=%d headers=%v body=%q", res.Code, res.Header(), res.Body.String())
 	}
 }
 
