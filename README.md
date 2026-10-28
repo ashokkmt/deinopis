@@ -1,6 +1,6 @@
-# DEINOPIS — Universal Log Pre-processing Framework
+# DEINOPIS — Universal Log Vault
 
-DEINOPIS accepts heterogeneous logs, keeps their original bytes in a local SQLite store, and converts recognized records into a versioned, OCSF-based JSON event with a link back to the original. Unknown, malformed, or ambiguous records are quarantined for inspection and replay after a parser pack is updated. This is a log preprocessor, not a SIEM, search engine, or production security boundary.
+DEINOPIS is a Universal Log Vault for heterogeneous security logs. It keeps original bytes in a local SQLite store, converts recognized records into versioned OCSF-based JSON events linked to their originals, and quarantines unknown, malformed, or ambiguous records for inspection and replay after parser packs are updated. Its collection and processing features remain available alongside the vault's integrity evidence workflow.
 
 The project includes a Go CLI/server, an embedded web management UI, YAML parser/source/sink definitions, and a synthetic log generator (`logsim`). It ships a reviewed set of local YAML parser packs and supports offline authoring, validation, testing, activation, and rollback. Configured cloud, broker, and output adapters retain their own network behavior. See [security guidance](SECURITY.md) before connecting real log sources.
 
@@ -95,7 +95,7 @@ The three YAML directories have distinct jobs: `packs/` say **what a log means**
 ### The three simulator/support commands
 
 - **`logsim`** generates fake firewall, ASA, SSHD, IDS, web-server, app, and database logs. It sends those records to DEINOPIS over one selected transport. It simulates log sources; it does not start a blockchain or verify integrity.
-- **`dino-sim`** starts a disposable, loopback-only Anvil chain and deploys/read-checks the registry contract. It generates no logs. It is a contract smoke test; the Dashboard integrity demo starts its own chain and temporary witness state.
+- **`dino-sim`** starts a disposable, loopback-only Anvil chain and deploys/read-checks the registry contract. It generates no logs. It is a contract smoke test; `dino -integrity-sim` is the opt-in mode that connects live synthetic HTTP ingestion to the local witness and Anvil simulation.
 - **`dino-witness`** is a separate mTLS service for receiving and retaining original integrity manifests and checking witness queue/history. It is not required for ordinary ingest or the Dashboard synthetic demo, and its current runtime does not publish to an external blockchain.
 
 Build and run commands for these tools and the four local/Docker combinations are in [CLI.md](CLI.md#build-the-command-line-tools) and [CLI.md](CLI.md#run-deinopis-and-logsim). The recommended arrangement is the host `dino` binary with all seven `logsim` containers started by `docker compose -f simulator.yaml up --build`; that sends Syslog UDP/TCP, HTTP, and spool files to the host collector. The CLI guide also documents local and Docker data resets.
@@ -106,15 +106,17 @@ Replay is the recovery path for an event DEINOPIS accepted but could not normali
 dino replay                         # list quarantined records and their IDs
 dino packs validate -f new-device.yaml
 dino packs test -f new-device.yaml -sample sample.log
-dino packs apply -f new-device.yaml
+dino packs apply -f new-device.yaml --no-replay
 dino replay QUARANTINE_ID           # replace with an ID from `dino replay`; or: dino replay all
 ```
 
-These are example placeholders: the pack must actually match a quarantined event. Pack activation currently also requests quarantine reconciliation; check its report before replaying an ID manually. Replay and live pack activation need the running management API. The `-verify` commands compare stored bytes/events to hashes in the same database; they are consistency checks, not independently anchored tamper-proof evidence.
+These are example placeholders: the pack must actually match a quarantined event. Live pack activation and replay need the running management API. By default, `dino packs apply` also requests quarantine reconciliation; use `--no-replay` when you want to activate packs first and trigger replay later from the UI or CLI. The `-verify` commands compare stored bytes/events to hashes in the same database; they are consistency checks, not independently anchored tamper-proof evidence.
 
 ## Integrity simulation
 
-DEINOPIS includes a synthetic-only demonstration of its local Merkle batching, witness manifest, Solidity registry, verification, recovery, and evidence export path. It uses the existing integrity code and contract with disposable collector/witness stores and a fresh Anvil instance bound to loopback. It does not read the normal collector database or real logs. Install [Foundry](https://getfoundry.sh/) so `forge` and `anvil` are available on `PATH` before starting the demo.
+DEINOPIS includes a fixed-seed Dashboard demo and an opt-in live-ingestion simulation for its local Merkle batching, witness manifest, Solidity registry, verification, recovery, and evidence export path. The fixed-seed demo creates its own disposable collector; live mode accepts synthetic HTTP logs into a new disposable collector database and uses a separate run-scoped witness store plus a fresh loopback Anvil instance. Neither mode reads your normal collector database or uses real logs. Install [Foundry](https://getfoundry.sh/) so `anvil` is available on `PATH` before starting either mode.
+
+For a judge-ready run of the fixed-seed demo, run `./scripts/run-integrity-demo.py`. It checks a clean snapshot, deletes one synthetic record inside its private collector, detects the loss, and saves the evidence under `results/simulated-integrity-demo-*/`. To demonstrate 50 logs entering a running server, a direct SQLite edit, and **TAMPERED** from the hybrid witness/registry verifier, follow the two-terminal procedure in [the live simulation runbook](plans/simulated-integrity-demo.md#live-visual-demo-send-logs-edit-a-sealed-record-verify). It runs only when explicitly started with `-integrity-sim` and refuses the default or a non-empty database, non-loopback listeners, other input types, enabled external connections, and external witness settings.
 
 To smoke-test the empty local registry:
 
@@ -126,7 +128,7 @@ go build -o bin/dino-sim ./cmd/dino-sim
 
 The process prints the temporary run directory, chain ID, registry address, and code hash. Press Ctrl+C to stop only the Anvil process it started. This is a **SIMULATED** local-chain result, not public-chain publication, independent custody, or production finality.
 
-To use the full Dashboard demonstration, start the regular server with a fresh test database and an admin token. This keeps the collector data used by the application separate from the simulator's own stores:
+To use the fixed-seed Dashboard demonstration, start the regular server with a fresh test database and an admin token. The simulator keeps its collector, witness and Anvil state separate:
 
 ```sh
 mkdir -p /tmp/deinopis-demo
@@ -175,6 +177,10 @@ Without Docker, build `logsim` into `bin/` with `mkdir -p bin && go build -o bin
 ```
 
 `logsim --source` accepts `firewall`, `asa`, `sshd`, `ids`, `webserver`, `app`, `database`, or `all`; it can emit to stdout, syslog UDP/TCP/TLS, HTTP POST, or files. The data is synthetic, not an enterprise source qualification. For the published measurements and repeatable 10,000-event methods, use [BENCHMARKING.md](BENCHMARKING.md).
+
+## Benchmark results
+
+The latest local benchmark report is in [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md). On an Apple M2 (macOS, arm64, Go 1.27.2), the 10,000-event pressure run measured 251.6 events/s, with all records normalized and none quarantined or pending. Go component benchmarks passed. The stdin run produced 10,000 normalized records and output lines, though its final delivered counter was 9,999; the HTTP run emitted, acknowledged, and delivered all 10,000 records in 63.857 seconds. These are local synthetic measurements, not production capacity claims.
 
 ## Deployment modes and safety
 

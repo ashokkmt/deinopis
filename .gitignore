@@ -2,6 +2,7 @@ plans/
 graphify-out/
 bin/
 data/
+results/
 *.db
 *.db-wal
 *.db-shm

@@ -380,6 +380,25 @@ func TestV1EvidenceRemainsUnchangedAcrossV2StreamCutover(t *testing.T) {
 	}
 }
 
+func TestConfigureVaultBatchTargetCountRequiresEmptyStore(t *testing.T) {
+	store := setupTestStore(t)
+	ctx := context.Background()
+	if err := store.ConfigureVaultBatchTargetCount(ctx, 10); err != nil {
+		t.Fatalf("configure empty store batch target: %v", err)
+	}
+	var got uint64
+	if err := store.DB().QueryRowContext(ctx, "SELECT target_count FROM vault_batch_streams WHERE id=1").Scan(&got); err != nil || got != 10 {
+		t.Fatalf("target count=%d err=%v", got, err)
+	}
+	acceptTestRecord(t, store, "accepted")
+	if err := store.ConfigureVaultBatchTargetCount(ctx, 20); err == nil {
+		t.Fatal("allowed target count change after acceptance")
+	}
+	if err := store.ConfigureVaultBatchTargetCount(ctx, 0); err == nil {
+		t.Fatal("allowed zero target count")
+	}
+}
+
 func TestFutureSchemaVersionRefusedWithoutDowngrade(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "future.db")
 	db, err := sql.Open("sqlite", path)

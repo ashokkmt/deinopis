@@ -8,12 +8,14 @@ import { Packs } from './pages/Packs';
 import { Config } from './pages/Config';
 import { apiService } from './services/api';
 import { SystemStats } from './types/telemetry';
+import { RuntimeConfig } from './types/config';
 
 export const App: React.FC = () => {
   const [currentTab, setCurrentTab] = useState<string>('dashboard');
   const [navParam, setNavParam] = useState<string | undefined>();
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [statsError, setStatsError] = useState<boolean>(false);
+  const [runtimeConfig, setRuntimeConfig] = useState<RuntimeConfig | null>(null);
 
   const fetchStats = async () => {
     try {
@@ -27,6 +29,7 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     fetchStats();
+    apiService.getConfig().then(setRuntimeConfig).catch(() => setRuntimeConfig(null));
     const interval = setInterval(fetchStats, 2000);
     return () => clearInterval(interval);
   }, []);
@@ -48,7 +51,7 @@ export const App: React.FC = () => {
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 min-w-0">
         {currentTab === 'dashboard' && (
-          <Dashboard onNavigate={handleNavigate} stats={stats} onRefreshStats={fetchStats} />
+          <Dashboard onNavigate={handleNavigate} stats={stats} onRefreshStats={fetchStats} integritySimulation={runtimeConfig?.integrity_simulation ?? false} />
         )}
         {currentTab === 'events' && <Events initialEventId={navParam} />}
         {currentTab === 'quarantine' && <Quarantine />}
@@ -60,7 +63,6 @@ export const App: React.FC = () => {
       <footer className="bg-[#161b22] border-t border-[#30363d] py-3 text-center text-xs font-mono text-[#8b949e]">
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
           <span>DEINOPIS </span>
-          {/* <span>DEINOPIS // SIH 26156 &mdash; Universal Log Pre-processing Framework</span> */}
           <span className="text-emerald-400">Local Parser Management &bull; Offline Ready</span>
         </div>
       </footer>

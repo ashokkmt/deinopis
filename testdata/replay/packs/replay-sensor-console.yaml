@@ -1,0 +1,19 @@
+apiVersion: dino.io/v1
+kind: LogSource
+metadata:
+  name: replay-sensor-console
+  version: 1.0.0
+  description: Synthetic sensor console text added after quarantine for replay demonstration
+  author: DEINOPIS Team
+spec:
+  sourceCategory: other
+  format: text
+  match:
+    contains: "[SENSOR-CONSOLE]"
+  fields:
+    message:
+      from: message
+      type: string
+  map:
+    message: event.message
+  preserveUnmapped: true

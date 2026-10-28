@@ -123,6 +123,33 @@ func (s *RawStore) ConfigureVaultBatchStream(ctx context.Context, streamID strin
 	return tx.Commit()
 }
 
+// ConfigureVaultBatchTargetCount sets a demo-sized batch target before any records are accepted.
+func (s *RawStore) ConfigureVaultBatchTargetCount(ctx context.Context, target uint64) error {
+	if target == 0 || target > vaultBatchHardCount {
+		return errors.New("v2 batch target count must be between 1 and the hard batch limit")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, table := range []string{"raw_events", "vault_batch_members", "vault_batch_manifests", "vault_batch_seal_tasks"} {
+		var count int
+		if err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table).Scan(&count); err != nil {
+			return err
+		}
+		if count != 0 {
+			return errors.New("v2 batch target is immutable after acceptance begins")
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE vault_batch_streams SET target_count=? WHERE id=1`, target); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func closeVaultBatchTx(ctx context.Context, tx *sql.Tx, streamID string, batchNo uint64, at time.Time, reason string) error {
 	res, err := tx.ExecContext(ctx, `UPDATE vault_batch_state SET closed=1,closed_at_ns=?,close_reason=? WHERE stream_id=? AND batch_no=? AND closed=0`, at.UTC().UnixNano(), reason, streamID, batchNo)
 	if err != nil {

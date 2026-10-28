@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"deinopis/internal/model"
+	"deinopis/internal/rawstore"
 	"deinopis/internal/witness"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
@@ -23,6 +27,82 @@ func TestValidateLoopbackEndpoint(t *testing.T) {
 	if err := validateLoopbackEndpoint("http://127.0.0.1:8545"); err != nil {
 		t.Fatalf("rejected loopback endpoint: %v", err)
 	}
+}
+
+func TestLiveIngestionSimulationAnchorsAndVerifiesBorrowedStore(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	dbPath := filepath.Join(t.TempDir(), "collector.db")
+	store, err := rawstore.New(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	demo, err := NewLiveDemo(ctx, store, dbPath, 10)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	defer demo.Close()
+	run, err := demo.Start(ctx)
+	if err != nil || run.InputMode != "LIVE_INGESTION" || run.Records != 0 {
+		t.Fatalf("live run summary=%+v err=%v", run, err)
+	}
+	if _, err = demo.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Store(ctx, model.IngestedRecord{Transport: "http", SourceIP: "127.0.0.1", RawBytes: []byte("synthetic-live-00"), ReceivedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := demo.Verify(ctx, run.RunID)
+	if err != nil || pending.Content != "INCOMPLETE" || pending.PendingRecords != 1 {
+		t.Fatalf("open batch classification=%+v err=%v", pending, err)
+	}
+	uploadCtx, cancelUpload := context.WithCancel(ctx)
+	defer cancelUpload()
+	uploadDone := make(chan error, 1)
+	go func() { uploadDone <- store.RunVaultBatchUploader(uploadCtx, demo, 10*time.Millisecond) }()
+	for i := 1; i < 20; i++ {
+		if _, err = store.Store(ctx, model.IngestedRecord{Transport: "http", SourceIP: "127.0.0.1", RawBytes: []byte(fmt.Sprintf("synthetic-live-%02d", i)), ReceivedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		run, err = demo.Start(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(run.Batches) == 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(run.Batches) != 2 || run.Records != 20 {
+		t.Fatalf("uploaded live summary=%+v", run)
+	}
+	result, err := demo.Verify(ctx, run.RunID)
+	if err != nil || result.Content != "INTACT" || result.RecordsChecked != 20 || result.PendingRecords != 0 {
+		t.Fatalf("intact live verify=%+v err=%v", result, err)
+	}
+	cancelUpload()
+	if err = <-uploadDone; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if err = demo.TamperDelete(ctx, run.RunID); err == nil {
+		t.Fatal("live demo exposed its destructive synthetic delete control")
+	}
+	if _, err = store.DB().ExecContext(ctx, "UPDATE raw_events SET payload=? WHERE raw_id=(SELECT raw_id FROM vault_batch_members ORDER BY accept_seq LIMIT 1)", []byte("attacker changed sealed record")); err != nil {
+		t.Fatal(err)
+	}
+	result, err = demo.Verify(ctx, run.RunID)
+	if err != nil || result.Content != "TAMPERED" || len(result.Issues) == 0 {
+		t.Fatalf("tampered live verify=%+v err=%v", result, err)
+	}
+	demo.Close()
+	if _, err = store.VaultBatchState(ctx); err != nil {
+		t.Fatalf("live demo closed its borrowed collector store: %v", err)
+	}
+	_ = store.Close()
 }
 
 func TestStartDeploysRegistryAndStopsOwnedAnvil(t *testing.T) {
@@ -181,5 +261,23 @@ func TestSyntheticDemoVerifiesAndLocalizesDeletion(t *testing.T) {
 	evidence, err := demo.Evidence(run.RunID)
 	if err != nil || !json.Valid(evidence) || !bytes.Contains(evidence, []byte(`"first_adverse_at_utc"`)) {
 		t.Fatalf("completed synthetic evidence export unavailable: err=%v", err)
+	}
+}
+
+func TestSyntheticDemoSurvivesStartRequestContextCancellation(t *testing.T) {
+	startCtx, cancelStart := context.WithTimeout(context.Background(), 45*time.Second)
+	demo := NewDemo()
+	defer demo.Close()
+	run, err := demo.Start(startCtx)
+	cancelStart()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	verifyCtx, cancelVerify := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelVerify()
+	result, err := demo.Verify(verifyCtx, run.RunID)
+	if err != nil || result.Content != "INTACT" || result.Coverage != "complete" {
+		t.Fatalf("demo did not survive start request cancellation: result=%+v err=%v", result, err)
 	}
 }

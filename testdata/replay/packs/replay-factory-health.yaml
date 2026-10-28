@@ -1,0 +1,29 @@
+apiVersion: dino.io/v1
+kind: LogSource
+metadata:
+  name: replay-factory-health
+  version: 1.0.0
+  description: Synthetic factory health XML added after quarantine for replay demonstration
+  author: DEINOPIS Team
+spec:
+  sourceCategory: iot
+  format: xml
+  match:
+    fieldEquals:
+      xml_root_local: "factory_health_event"
+  fields:
+    timestamp:
+      from: timestamp
+      type: timestamp
+      layout: "2006-01-02T15:04:05Z"
+    device_id:
+      from: device_id
+      type: string
+    message:
+      from: message
+      type: string
+  map:
+    timestamp: event.time
+    device_id: event.actor.user.uid
+    message: event.message
+  preserveUnmapped: true

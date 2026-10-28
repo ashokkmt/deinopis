@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -177,7 +178,7 @@ func main() {
 			return
 
 		case "packs", "-packs", "--packs":
-			pDir, uiAddr, local := "packs", ":9090", false
+			pDir, uiAddr, local, noReplay := "packs", ":9090", false, false
 			for i, a := range os.Args {
 				if (a == "-packs-dir" || a == "--packs-dir") && i+1 < len(os.Args) {
 					pDir = os.Args[i+1]
@@ -190,6 +191,9 @@ func main() {
 				}
 				if a == "--local" {
 					local = true
+				}
+				if a == "--no-replay" {
+					noReplay = true
 				}
 			}
 			os.Args = append([]string{os.Args[0], os.Args[1]}, stripCommandOptions(os.Args[2:], true)...)
@@ -227,12 +231,12 @@ func main() {
 							if local {
 								cli.ApplyPackLocalCLI(os.Args[i+1], pDir)
 							} else {
-								cli.ApplyPackCLI(os.Args[i+1], uiAddr, pDir)
+								cli.ApplyPackCLI(os.Args[i+1], uiAddr, pDir, noReplay)
 							}
 							return
 						}
 					}
-					fmt.Fprintln(os.Stderr, "Usage: dino packs apply -f <file.yaml> [--local]")
+					fmt.Fprintln(os.Stderr, "Usage: dino packs apply -f <file.yaml> [--local] [--no-replay]")
 					return
 				case "install", "fetch", "upgrade", "outdated", "remove":
 					fmt.Fprintf(os.Stderr, "unsupported command: dino packs %s was removed\n", sub)
@@ -254,7 +258,7 @@ func main() {
 			}
 			for i, a := range os.Args {
 				if (a == "-f" || a == "--f") && i+1 < len(os.Args) {
-					cli.ApplyPackCLI(os.Args[i+1], ":9090", pDir)
+					cli.ApplyPackCLI(os.Args[i+1], ":9090", pDir, false)
 					return
 				}
 			}
@@ -284,6 +288,7 @@ func main() {
 	}
 
 	dbPath := flag.String("db", "data/deinopis.db", "Path to SQLite raw store database")
+	integritySimulation := flag.Bool("integrity-sim", false, "Enable isolated live-ingestion hybrid integrity simulation (requires a fresh database and loopback listeners)")
 	packsDir := flag.String("packs-dir", "packs", "Path to YAML parser packs directory")
 	sourcesDir := flag.String("sources-dir", "sources", "Path to YAML Ingestion Source resources directory")
 	sinksDir := flag.String("sinks-dir", "sinks", "Path to YAML Delivery Sink resources directory")
@@ -320,6 +325,14 @@ func main() {
 	uiAddr := flag.String("ui", "127.0.0.1:9090", "Address for Management Web UI and Control Plane API (loopback by default; use TLS termination before public exposure, 'none' to disable)")
 	adminToken := flag.String("admin-token", "", "Optional secret token for authenticating control-plane mutation API routes")
 	flag.Parse()
+	if *integritySimulation {
+		stdin, stdinErr := os.Stdin.Stat()
+		interactive := stdinErr == nil && stdin.Mode()&os.ModeCharDevice != 0
+		if err := validateIntegritySimulation(*dbPath, *httpAddr, *uiAddr, *syslogUDP, *syslogTCP, *syslogTLS, *inboxDir, *inputFile, *outputFile, *readStdin, *detached, interactive); err != nil {
+			fmt.Fprintf(os.Stderr, "FATAL: live integrity simulation: %v\n", err)
+			os.Exit(2)
+		}
+	}
 
 	// Handle standalone actions parsed via flags
 	if *stopFlag {
@@ -351,6 +364,21 @@ func main() {
 	if *detached {
 		cli.RunDaemonMode(cli.DefaultPIDFile, cli.DefaultLogFile, *uiAddr, *packsDir)
 		return
+	}
+	var connMgr *connections.Manager
+	if *integritySimulation {
+		var err error
+		connMgr, err = loadConnectionManager(*sourcesDir, *sinksDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FATAL: live integrity simulation connection configuration: %v\n", err)
+			os.Exit(2)
+		}
+		for _, connection := range connMgr.List() {
+			if connection.Spec.Enabled {
+				fmt.Fprintf(os.Stderr, "FATAL: live integrity simulation refuses enabled external connection %q\n", connection.Metadata.Name)
+				os.Exit(2)
+			}
+		}
 	}
 
 	// Ensure directory exists for database
@@ -430,14 +458,29 @@ func main() {
 
 	// The window sealer runs even without a witness; uploading is enabled only
 	// when the complete mutually authenticated witness configuration is present.
-	vaultClient, streamID, err := configureVaultWitness(store)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "FATAL: vault witness configuration: %v\n", err)
-		os.Exit(1)
+	var vaultClient *witness.Client
+	var vaultUploader rawstore.BatchUploader
+	var integrityDemo *simulator.Demo
+	var streamID string
+	if *integritySimulation {
+		integrityDemo, err = simulator.NewLiveDemo(context.Background(), store, *dbPath, 10)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FATAL: could not initialize live integrity simulation: %v\n", err)
+			os.Exit(1)
+		}
+		vaultUploader = integrityDemo
+		fmt.Fprintln(os.Stderr, " Hybrid integrity simulation active: fresh collector DB + local witness + loopback Anvil")
+	} else {
+		vaultClient, streamID, err = configureVaultWitness(store)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FATAL: vault witness configuration: %v\n", err)
+			os.Exit(1)
+		}
+		vaultUploader = vaultClient
 	}
 
 	fmt.Fprintf(os.Stderr, "========================================================\n")
-	fmt.Fprintf(os.Stderr, " DEINOPIS: Universal Log Pre-processing Framework (SIH 26156)\n")
+	fmt.Fprintf(os.Stderr, " DEINOPIS: Universal Log Vault\n")
 
 	// 1. Load Parser Packs
 	var packManager *packs.SnapshotManager
@@ -502,12 +545,14 @@ func main() {
 			fmt.Fprintf(os.Stderr, "ERROR: vault batch sealer stopped: %v\n", err)
 		}
 	}()
-	if vaultClient != nil {
+	if vaultUploader != nil {
 		go func() {
-			if err := store.RunVaultBatchUploader(ctx, vaultClient, time.Second); err != nil && ctx.Err() == nil {
+			if err := store.RunVaultBatchUploader(ctx, vaultUploader, time.Second); err != nil && ctx.Err() == nil {
 				fmt.Fprintf(os.Stderr, "ERROR: vault batch uploader stopped: %v\n", err)
 			}
 		}()
+	}
+	if vaultClient != nil {
 		go runVaultHeartbeats(ctx, store, vaultClient, streamID)
 	}
 
@@ -555,21 +600,14 @@ func main() {
 		staticAdapters = append(staticAdapters, ingest.NewFileWatcher(*inboxDir, 1*time.Second))
 		fmt.Fprintf(os.Stderr, " Ingest adapter configured: Spool Inbox on %s\n", *inboxDir)
 	}
+	if connMgr == nil {
+		connMgr, err = loadConnectionManager(*sourcesDir, *sinksDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FATAL: connection configuration: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
-	connMgr := connections.NewManager(*sinksDir)
-	connMgr.SetResourceDirs(*sourcesDir, *sinksDir)
-	if *sourcesDir != "" {
-		if err := connMgr.LoadDir(*sourcesDir); err != nil {
-			fmt.Fprintf(os.Stderr, "FATAL: source configuration: %v\n", err)
-			os.Exit(1)
-		}
-	}
-	if *sinksDir != "" {
-		if err := connMgr.LoadDir(*sinksDir); err != nil {
-			fmt.Fprintf(os.Stderr, "FATAL: sink configuration: %v\n", err)
-			os.Exit(1)
-		}
-	}
 	runtimeReconciler := &connections.Runtime{Ingest: mgr, Output: dynamicSink, StaticAdapters: staticAdapters, StaticSinks: staticSinks, Secrets: connections.SecretResolver{Dir: "secrets"}}
 	if err := runtimeReconciler.Reconcile(connMgr.List()); err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: runtime reconcile: %v\n", err)
@@ -586,20 +624,24 @@ func main() {
 	var uiServer *api.Server
 	if *uiAddr != "" && *uiAddr != "none" {
 		cfgInfo := api.ConfigInfo{
-			UIAddress:  *uiAddr,
-			SyslogUDP:  *syslogUDP,
-			SyslogTCP:  *syslogTCP,
-			SyslogTLS:  *syslogTLS,
-			HTTPIngest: *httpAddr,
-			InboxDir:   *inboxDir,
-			DBPath:     *dbPath,
-			Workers:    *workers,
-			AdminToken: *adminToken,
+			UIAddress:           *uiAddr,
+			SyslogUDP:           *syslogUDP,
+			SyslogTCP:           *syslogTCP,
+			SyslogTLS:           *syslogTLS,
+			HTTPIngest:          *httpAddr,
+			InboxDir:            *inboxDir,
+			DBPath:              *dbPath,
+			Workers:             *workers,
+			AdminToken:          *adminToken,
+			IntegritySimulation: *integritySimulation,
 		}
 		uiServer = api.NewServer(*uiAddr, store, p, packManager, *packsDir, cfgInfo, web.Dist(), Version)
 		uiServer.SetIngestTracker(mgr)
 		uiServer.SetConnManager(connMgr, *sinksDir)
-		uiServer.SetIntegrityDemo(simulator.NewDemo())
+		if integrityDemo == nil {
+			integrityDemo = simulator.NewDemo()
+		}
+		uiServer.SetIntegrityDemo(integrityDemo)
 		if err := uiServer.Start(); err != nil {
 			fmt.Fprintf(os.Stderr, "WARNING: Failed to start Management UI on %s: %v\n", *uiAddr, err)
 		} else {
@@ -713,12 +755,12 @@ func main() {
 	}
 
 	// Graceful shutdown sequence
+	cancel()
 	if uiServer != nil {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = uiServer.Stop(shutdownCtx)
 		shutdownCancel()
 	}
-	cancel()
 	_ = mgr.Stop()
 	p.Stop()
 	_ = compositeSink.Flush()
@@ -752,6 +794,7 @@ func stripCommandOptions(args []string, stripJSON bool) []string {
 		case "--packs-dir", "-packs-dir", "--ui", "--admin-token":
 			i++
 		case "--local":
+		case "--no-replay":
 		case "--json":
 			if !stripJSON {
 				out = append(out, args[i])
@@ -761,6 +804,73 @@ func stripCommandOptions(args []string, stripJSON bool) []string {
 		}
 	}
 	return out
+}
+
+func validateIntegritySimulation(dbPath, httpAddr, uiAddr, udpAddr, tcpAddr, tlsAddr, inboxDir, inputFile, outputFile string, readStdin, detached, interactiveStdin bool) error {
+	requestedDB, requestedErr := filepath.Abs(dbPath)
+	defaultDB, defaultErr := filepath.Abs("data/deinopis.db")
+	if requestedErr != nil || defaultErr != nil {
+		return errors.New("resolve the disposable database path")
+	}
+	if filepath.Clean(requestedDB) == filepath.Clean(defaultDB) {
+		return errors.New("pass a separate disposable -db path; the default collector database is not allowed")
+	}
+	if info, err := os.Stat(dbPath); err == nil && info.Size() > 0 {
+		return errors.New("database already exists and is non-empty; choose a fresh disposable -db path")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect disposable database path: %w", err)
+	}
+	if !loopbackListener(httpAddr) || !loopbackListener(uiAddr) {
+		return errors.New("HTTP ingest and UI must bind to explicit loopback IP addresses")
+	}
+	if os.Getenv("DEINOPIS_VAULT_STREAM_ID") != "" || hasDeinopisWitnessEnv() {
+		return errors.New("external witness configuration is not allowed in live simulation mode")
+	}
+	if udpAddr != "none" || tcpAddr != "none" || tlsAddr != "none" || inboxDir != "none" || inputFile != "" || readStdin || detached {
+		return errors.New("disable syslog, inbox, file/stdin ingestion, and detached mode; live simulation accepts loopback HTTP only")
+	}
+	if outputFile != "none" {
+		return errors.New("set -output-file none; live simulation does not enable file outputs")
+	}
+	if !interactiveStdin {
+		return errors.New("stdin must be an interactive terminal; use </dev/tty when starting from a shell script")
+	}
+	return nil
+}
+
+func loopbackListener(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func loadConnectionManager(sourcesDir, sinksDir string) (*connections.Manager, error) {
+	mgr := connections.NewManager(sinksDir)
+	mgr.SetResourceDirs(sourcesDir, sinksDir)
+	if sourcesDir != "" {
+		if err := mgr.LoadDir(sourcesDir); err != nil {
+			return nil, fmt.Errorf("source configuration: %w", err)
+		}
+	}
+	if sinksDir != "" {
+		if err := mgr.LoadDir(sinksDir); err != nil {
+			return nil, fmt.Errorf("sink configuration: %w", err)
+		}
+	}
+	return mgr, nil
+}
+
+func hasDeinopisWitnessEnv() bool {
+	for _, item := range os.Environ() {
+		name, value, _ := strings.Cut(item, "=")
+		if strings.HasPrefix(name, "DEINOPIS_WITNESS_") && value != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func configureVaultWitness(store *rawstore.RawStore) (*witness.Client, string, error) {

@@ -32,15 +32,16 @@ import (
 
 // ConfigInfo holds runtime server parameters for the /api/v1/config endpoint.
 type ConfigInfo struct {
-	UIAddress  string `json:"ui_address"`
-	SyslogUDP  string `json:"syslog_udp"`
-	SyslogTCP  string `json:"syslog_tcp"`
-	SyslogTLS  string `json:"syslog_tls,omitempty"`
-	HTTPIngest string `json:"http_ingest"`
-	InboxDir   string `json:"inbox_dir"`
-	DBPath     string `json:"db_path"`
-	Workers    int    `json:"workers"`
-	AdminToken string `json:"-"`
+	UIAddress           string `json:"ui_address"`
+	SyslogUDP           string `json:"syslog_udp"`
+	SyslogTCP           string `json:"syslog_tcp"`
+	SyslogTLS           string `json:"syslog_tls,omitempty"`
+	HTTPIngest          string `json:"http_ingest"`
+	InboxDir            string `json:"inbox_dir"`
+	DBPath              string `json:"db_path"`
+	Workers             int    `json:"workers"`
+	IntegritySimulation bool   `json:"integrity_simulation"`
+	AdminToken          string `json:"-"`
 }
 
 // IngestTracker provides adapter operational status for health checks.

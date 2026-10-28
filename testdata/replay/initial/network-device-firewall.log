@@ -1,0 +1,1 @@
+<134>Sep 12 10:15:30 pa-fw-01 TRAFFIC: vendor_product=PAN-OS action=allow src=10.0.1.50 sport=49312 dst=203.0.113.25 dport=443 bytes_sent=2340 bytes_recv=18720 proto=tcp rule=allow-outbound-https app=ssl session_id=8827364

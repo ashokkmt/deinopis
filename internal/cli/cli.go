@@ -138,7 +138,7 @@ func daemonStartupBanner(pid int, command, uiAddr, logFile, packsDir string) str
   * Quick Commands:
       %s packs list                       # List active parser packs
       %s packs get <name>                 # View a pack YAML definition
-      %s packs apply -f <pack.yaml>       # Validate and activate a local pack
+      %s packs apply -f <pack.yaml> [--no-replay] # Activate a pack; optionally leave quarantine pending
       %s sources list                     # List active ingestion sources
       %s sinks list                       # List active delivery sinks
       %s replay [id|all]                  # Manage or replay quarantined records
@@ -310,7 +310,11 @@ func ViewPackCLI(packName, uiAddr, packsDir string) {
 	fmt.Println(string(data))
 }
 
-func ApplyPackCLI(packFilePath, uiAddr, packsDir string) {
+func ApplyPackCLI(packFilePath, uiAddr, packsDir string, noReplay bool) {
+	applyPackCLI(packFilePath, uiAddr, packsDir, noReplay, &http.Client{Timeout: 3 * time.Second})
+}
+
+func applyPackCLI(packFilePath, uiAddr, packsDir string, noReplay bool, client *http.Client) {
 	data, err := os.ReadFile(packFilePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to read pack file %s: %v\n", packFilePath, err)
@@ -326,7 +330,6 @@ func ApplyPackCLI(packFilePath, uiAddr, packsDir string) {
 
 	// Apply through the running owner so disk and runtime snapshots change together.
 	baseURL := GetBaseURL(uiAddr)
-	client := &http.Client{Timeout: 3 * time.Second}
 
 	reqBody, _ := json.Marshal(map[string]string{
 		"yaml_content": string(data),
@@ -351,6 +354,10 @@ func ApplyPackCLI(packFilePath, uiAddr, packsDir string) {
 	}
 	resp.Body.Close()
 	fmt.Printf("\n[DEINOPIS] Pack %s v%s validated and activated.\n", pack.Metadata.Name, pack.Metadata.Version)
+	if noReplay {
+		fmt.Println("[DEINOPIS] Quarantine replay deferred; use the UI or dino replay when ready.")
+		return
+	}
 
 	// 3. Reconcile quarantine DLQ: trigger bulk replay for matching quarantined logs
 	fmt.Printf("[DEINOPIS] Reconciling Quarantine DLQ against newly activated pack...\n")

@@ -547,7 +547,7 @@ export const Config: React.FC = () => {
                 <div className="flex items-center justify-between p-3 rounded-md bg-[#0d1117] border border-[#21262d] gap-3 min-w-0">
                   <div className="min-w-0 flex-1">
                     <div className="text-[#f0f6fc] font-semibold truncate">DEINOPIS Release Version</div>
-                    <div className="text-[11px] text-[#8b949e] truncate mt-0.5">SIH 26156 reference core</div>
+                    <div className="text-[11px] text-[#8b949e] truncate mt-0.5">Universal Log Vault core</div>
                   </div>
                   <div className="shrink-0">
                     <Badge variant="purple">{config?.version || 'dev'}</Badge>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<factory_health_event>
+  <timestamp>2026-10-28T10:20:00Z</timestamp>
+  <device_id>press-line-7</device_id>
+  <message>coolant pressure below warning threshold</message>
+</factory_health_event>

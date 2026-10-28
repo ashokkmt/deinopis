@@ -8,4 +8,5 @@ export interface RuntimeConfig {
   db_path: string;
   workers: number;
   version: string;
+  integrity_simulation: boolean;
 }

@@ -1,7 +1,7 @@
 name: deinopis-simulation
 
 services:
-  # Core Universal Log Pre-processing Framework (DEINOPIS)
+  # Core DEINOPIS Universal Log Vault
   deinopis:
     build:
       context: .

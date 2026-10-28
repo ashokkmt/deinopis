@@ -73,6 +73,7 @@ dino packs get network-device-firewall
 dino packs validate -f packs/new-device.yaml
 dino packs test -f packs/new-device.yaml -sample sample.log
 dino packs apply -f packs/new-device.yaml
+dino packs apply -f packs/new-device.yaml --no-replay --ui 127.0.0.1:9090
 dino packs rollback
 
 dino sources list
@@ -92,7 +93,7 @@ dino replay QUARANTINE_ID
 dino replay all
 ```
 
-Pack validation and testing do not activate YAML. `apply` normally uses the running management API; `--local --packs-dir <dir>` is for a stopped installation with no active directory owner. Local changes load at the next startup. Do not use local mode to bypass a failed authenticated live operation.
+Pack validation and testing do not activate YAML. `apply` normally uses the running management API and automatically bulk-replays eligible quarantine entries. Add `--no-replay` to activate the pack in the live parser snapshot while leaving quarantine pending for a later UI or CLI replay. Live pack activation and replay are protected management writes: set `DEINOPIS_ADMIN_TOKEN` in the CLI and server environments, then enter the same token in the UI's management-token setting. For example, activate live with `./bin/dino packs apply -f packs/new-device.yaml --no-replay --ui 127.0.0.1:9090`, then click **Replay All** in the Quarantine view. This is useful when an operator wants to activate several packs before manually reviewing or starting replay. `--local --packs-dir <dir>` is for a stopped installation with no active directory owner; local changes load at the next startup. Do not use local mode to bypass a failed authenticated live operation.
 
 ## Build the command-line tools
 
@@ -256,7 +257,7 @@ For the full synthetic workflow, install Foundry so `forge` and `anvil` are on `
 
 **Delete one synthetic record** and **Delete synthetic tail batch** affect only that run's temporary collector. **Export evidence** downloads `deinopis-simulated-integrity-evidence.json` after a completed check. It contains run/scope metadata, local registry and witness references, verification and first-adverse times, checksums, and explicit claim limits; raw event payloads are excluded. The first adverse observation is retained in the run-scoped witness database across retries, witness-store reopen, and synthetic recovery.
 
-All demo routes require the configured admin token and accept no normal database/path selector. The demo does not start automatically, does not use the collector's normal database, and does not connect to a public RPC. Same-host witness state is not independent custody; local Anvil readback is not public-chain finality. No production scheduler, resumable async verification jobs, or trusted production integrity UI/API is implemented.
+All demo routes require the configured admin token and accept no database/path selector. The fixed-seed demo does not start automatically and uses its own temporary database. For the separate live-ingestion variant, pass `-integrity-sim` only with a new disposable `-db` path, loopback HTTP/UI listeners, disabled other ingestion and output, and empty or disabled external connection configurations. It rejects the default database and non-empty existing files. Run the complete 50-log, manual-edit workflow in [the simulated integrity demo runbook](plans/simulated-integrity-demo.md#live-visual-demo-send-logs-edit-a-sealed-record-verify). Normal startup remains unchanged. Same-host witness state is not independent custody; local Anvil readback is not public-chain finality. No production scheduler, resumable async verification jobs, or trusted production integrity UI/API is implemented.
 
 Install Foundry so `anvil` and `forge` are available, then build and run the local registry smoke test:
 

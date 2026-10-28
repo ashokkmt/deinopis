@@ -33,6 +33,7 @@ var ErrRunNotFound = errors.New("simulated integrity run not found")
 
 type DemoSummary struct {
 	Mode             string            `json:"mode"`
+	InputMode        string            `json:"input_mode"`
 	RunID            string            `json:"run_id"`
 	StreamID         string            `json:"stream_id"`
 	GeneratorVersion string            `json:"generator_version"`
@@ -55,6 +56,7 @@ type DemoBatch struct {
 	LastSequence   uint64      `json:"last_sequence"`
 	Records        uint64      `json:"records"`
 	CloseReason    string      `json:"close_reason"`
+	MerkleRoot     string      `json:"merkle_root"`
 	WitnessReceipt string      `json:"witness_receipt"`
 	Anchor         LocalAnchor `json:"anchor"`
 }
@@ -77,6 +79,7 @@ type DemoVerification struct {
 	Coverage       string              `json:"coverage"`
 	RecordsChecked int                 `json:"records_checked"`
 	BatchesChecked int                 `json:"batches_checked"`
+	PendingRecords int                 `json:"pending_records"`
 	Issues         []VerificationIssue `json:"issues"`
 }
 
@@ -90,6 +93,7 @@ type demoRun struct {
 	fingerprint   string
 	token         string
 	chainSnapshot string
+	ownsStore     bool
 	mu            sync.Mutex
 }
 
@@ -101,10 +105,95 @@ type Demo struct {
 
 func NewDemo() *Demo { return &Demo{} }
 
+// NewLiveDemo attaches the local witness/Anvil simulation to an empty, disposable collector store.
+func NewLiveDemo(ctx context.Context, store *rawstore.RawStore, dbPath string, targetCount uint64) (*Demo, error) {
+	if store == nil || dbPath == "" {
+		return nil, errors.New("live simulation requires an open disposable store and its database path")
+	}
+	var accepted int
+	if err := store.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM raw_events").Scan(&accepted); err != nil {
+		return nil, err
+	}
+	if accepted != 0 {
+		return nil, errors.New("live simulation requires a fresh collector database")
+	}
+	root, err := os.MkdirTemp("", "deinopis-live-integrity-demo-")
+	if err != nil {
+		return nil, err
+	}
+	if err = os.Chmod(root, 0700); err != nil {
+		_ = os.RemoveAll(root)
+		return nil, err
+	}
+	failed := true
+	defer func() {
+		if failed {
+			_ = os.RemoveAll(root)
+		}
+	}()
+	var runBytes [16]byte
+	if _, err = crand.Read(runBytes[:]); err != nil {
+		return nil, err
+	}
+	runID := hex.EncodeToString(runBytes[:])
+	stream := sha256.Sum256(append([]byte("deinopis-live-sim-stream:"), runBytes[:]...))
+	streamID := hex.EncodeToString(stream[:])
+	tokenBytes := make([]byte, 32)
+	if _, err = crand.Read(tokenBytes); err != nil {
+		return nil, err
+	}
+	token := hex.EncodeToString(tokenBytes)
+	fingerprint := sha256.Sum256(append([]byte("deinopis-live-sim-witness:"), runBytes[:]...))
+	fingerprintText := hex.EncodeToString(fingerprint[:])
+	wit, err := witness.NewStore(filepath.Join(root, "witness.sqlite"), filepath.Join(root, "witness-manifests"))
+	if err != nil {
+		return nil, err
+	}
+	closeWitness := true
+	defer func() {
+		if closeWitness {
+			_ = wit.Close()
+		}
+	}()
+	if err = wit.EnrollBatch(ctx, streamID, fingerprintText, token); err != nil {
+		return nil, err
+	}
+	runner, err := start(context.WithoutCancel(ctx), root)
+	if err != nil {
+		return nil, err
+	}
+	chainSnapshot, err := runner.Snapshot(ctx)
+	if err != nil {
+		runner.Stop()
+		return nil, err
+	}
+	if err = store.ConfigureVaultBatchStream(ctx, streamID); err != nil {
+		runner.Stop()
+		return nil, err
+	}
+	if err = store.ConfigureVaultBatchTargetCount(ctx, targetCount); err != nil {
+		runner.Stop()
+		return nil, err
+	}
+	summary := DemoSummary{Mode: "SIMULATED", InputMode: "LIVE_INGESTION", RunID: runID, StreamID: streamID, CollectorPath: dbPath, WitnessPath: filepath.Join(root, "witness.sqlite"), AnvilRunDir: runner.RunDir, ChainID: runner.ChainID.String(), Registry: runner.Registry.Hex(), RegistryCodeHash: runner.RegistryHash.Hex(), EvidencePath: filepath.Join(root, "qualification.json"), FixtureDigests: map[string]string{}}
+	run := &demoRun{summary: summary, store: store, witness: wit, runner: runner, root: root, streamID: streamID, fingerprint: fingerprintText, token: token, chainSnapshot: chainSnapshot, ownsStore: false}
+	d := &Demo{run: run}
+	closeWitness = false
+	failed = false
+	return d, nil
+}
+
 func (d *Demo) Start(ctx context.Context) (DemoSummary, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.run != nil {
+		if !d.run.ownsStore {
+			d.run.mu.Lock()
+			summary := d.run.summary
+			summary.Batches = append([]DemoBatch(nil), summary.Batches...)
+			d.run.mu.Unlock()
+			return summary, nil
+		}
 		d.run.mu.Lock()
 		d.run.close()
 		d.run.mu.Unlock()
@@ -168,7 +257,9 @@ func (d *Demo) Start(ctx context.Context) (DemoSummary, error) {
 	if err = wit.EnrollBatch(ctx, streamID, fingerprintText, token); err != nil {
 		return DemoSummary{}, err
 	}
-	runner, err := start(ctx, root)
+	// The HTTP request that starts a demo ends immediately after this returns;
+	// keep the owned Anvil process alive until Demo.Close instead.
+	runner, err := start(context.WithoutCancel(ctx), root)
 	if err != nil {
 		return DemoSummary{}, err
 	}
@@ -183,7 +274,7 @@ func (d *Demo) Start(ctx context.Context) (DemoSummary, error) {
 			runner.Stop()
 		}
 	}()
-	summary := DemoSummary{Mode: "SIMULATED", RunID: runID, StreamID: streamID, GeneratorVersion: demoGeneratorVersion, Seed: demoSeed, Records: 13, FixtureDigests: map[string]string{}, CollectorPath: filepath.Join(root, "collector.sqlite"), WitnessPath: filepath.Join(root, "witness.sqlite"), AnvilRunDir: runner.RunDir, ChainID: runner.ChainID.String(), Registry: runner.Registry.Hex(), RegistryCodeHash: runner.RegistryHash.Hex(), EvidencePath: filepath.Join(root, "qualification.json")}
+	summary := DemoSummary{Mode: "SIMULATED", InputMode: "FIXED_SYNTHETIC", RunID: runID, StreamID: streamID, GeneratorVersion: demoGeneratorVersion, Seed: demoSeed, Records: 13, FixtureDigests: map[string]string{}, CollectorPath: filepath.Join(root, "collector.sqlite"), WitnessPath: filepath.Join(root, "witness.sqlite"), AnvilRunDir: runner.RunDir, ChainID: runner.ChainID.String(), Registry: runner.Registry.Hex(), RegistryCodeHash: runner.RegistryHash.Hex(), EvidencePath: filepath.Join(root, "qualification.json")}
 	rng := rand.New(rand.NewSource(demoSeed))
 	fixtureHashes := map[string]hashCollector{}
 	base := time.Now().UTC().Truncate(time.Second)
@@ -222,7 +313,7 @@ func (d *Demo) Start(ctx context.Context) (DemoSummary, error) {
 		if e != nil {
 			return DemoSummary{}, e
 		}
-		summary.Batches = append(summary.Batches, DemoBatch{BatchNo: batchNo, FirstSequence: batch.FirstSequence, LastSequence: batch.LastSequence, Records: batch.EntryCount, CloseReason: batch.CloseReason, WitnessReceipt: fmt.Sprintf("local witness receipt %s", hex.EncodeToString(receipt.Digest[:])), Anchor: anchor})
+		summary.Batches = append(summary.Batches, DemoBatch{BatchNo: batchNo, FirstSequence: batch.FirstSequence, LastSequence: batch.LastSequence, Records: batch.EntryCount, CloseReason: batch.CloseReason, MerkleRoot: hex.EncodeToString(batch.Root[:]), WitnessReceipt: fmt.Sprintf("local witness receipt %s", hex.EncodeToString(receipt.Digest[:])), Anchor: anchor})
 	}
 	body, err := json.MarshalIndent(summary, "", "  ")
 	if err != nil {
@@ -235,7 +326,7 @@ func (d *Demo) Start(ctx context.Context) (DemoSummary, error) {
 	closeStore = false
 	closeWitness = false
 	failed = false
-	d.run = &demoRun{summary: summary, store: store, witness: wit, runner: runner, root: root, streamID: streamID, fingerprint: fingerprintText, token: token, chainSnapshot: chainSnapshot}
+	d.run = &demoRun{summary: summary, store: store, witness: wit, runner: runner, root: root, streamID: streamID, fingerprint: fingerprintText, token: token, chainSnapshot: chainSnapshot, ownsStore: true}
 	return summary, nil
 }
 
@@ -284,6 +375,39 @@ func (d *Demo) Evidence(runID string) ([]byte, error) {
 	return os.ReadFile(run.summary.EvidencePath)
 }
 
+// UploadBatch accepts the collector's durable queue item into the local witness and Anvil registry.
+func (d *Demo) UploadBatch(ctx context.Context, streamID string, batchNo uint64, digest integrity.Digest, body []byte) (string, error) {
+	d.mu.Lock()
+	run := d.run
+	d.mu.Unlock()
+	if run == nil || run.ownsStore {
+		return "", errors.New("live simulated publisher is not configured")
+	}
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if streamID != run.streamID {
+		return "", errors.New("queued batch belongs to another simulated stream")
+	}
+	batch, err := run.store.SealedBatch(ctx, batchNo)
+	if err != nil {
+		return "", err
+	}
+	if batch.Digest != digest || !equalBytes(batch.Manifest, body) {
+		return "", errors.New("queued batch differs from the sealed collector manifest")
+	}
+	receipt, err := run.witness.AcceptBatch(ctx, streamID, batchNo, hex.EncodeToString(digest[:]), run.fingerprint, run.token, body, time.Now().UTC())
+	if err != nil {
+		return "", err
+	}
+	anchor, err := run.runner.PublishBatch(ctx, batch)
+	if err != nil {
+		return "", err
+	}
+	run.summary.Records = int(batch.LastSequence)
+	run.summary.Batches = append(run.summary.Batches, DemoBatch{BatchNo: batchNo, FirstSequence: batch.FirstSequence, LastSequence: batch.LastSequence, Records: batch.EntryCount, CloseReason: batch.CloseReason, MerkleRoot: hex.EncodeToString(batch.Root[:]), WitnessReceipt: fmt.Sprintf("local witness receipt %s", hex.EncodeToString(receipt.Digest[:])), Anchor: anchor})
+	return hex.EncodeToString(receipt.Digest[:]), nil
+}
+
 func (r *demoRun) writeEvidence(ctx context.Context, result DemoVerification) error {
 	history, err := r.runner.ReadHistory(ctx, r.streamID)
 	evidence := struct {
@@ -330,7 +454,13 @@ func (r *demoRun) writeEvidence(ctx context.Context, result DemoVerification) er
 	for _, batch := range manifests {
 		evidence.ManifestDigests = append(evidence.ManifestDigests, hex.EncodeToString(batch.Digest[:]))
 	}
-	for _, path := range []string{filepath.Join(r.root, "demo.json"), filepath.Join(r.runner.RunDir, "run.json"), r.summary.CollectorPath, r.summary.WitnessPath} {
+	paths := []string{filepath.Join(r.runner.RunDir, "run.json")}
+	if r.ownsStore {
+		paths = append(paths, r.summary.CollectorPath, r.summary.WitnessPath, filepath.Join(r.root, "demo.json"))
+	} else {
+		evidence.EvidenceNotes = append(evidence.EvidenceNotes, "live collector and witness databases are open during verification and are omitted from file checksums")
+	}
+	for _, path := range paths {
 		sum, hashErr := fileSHA256(path)
 		if hashErr == nil {
 			evidence.ArtifactChecksums[filepath.Base(path)] = sum
@@ -380,6 +510,9 @@ func (d *Demo) TamperDelete(ctx context.Context, runID string) error {
 	}
 	run.mu.Lock()
 	defer run.mu.Unlock()
+	if !run.ownsStore {
+		return errors.New("tamper controls are unavailable in live-ingestion mode; edit only its disposable demo database manually")
+	}
 	if _, err = run.store.DB().ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
 		return err
 	}
@@ -418,6 +551,9 @@ func (d *Demo) TamperDeleteTail(ctx context.Context, runID string) error {
 	}
 	run.mu.Lock()
 	defer run.mu.Unlock()
+	if !run.ownsStore {
+		return errors.New("tamper controls are unavailable in live-ingestion mode; edit only its disposable demo database manually")
+	}
 	if len(run.summary.Batches) == 0 {
 		return errors.New("synthetic tail batch is unavailable")
 	}
@@ -493,7 +629,7 @@ func (r *demoRun) appendRecovery(ctx context.Context, lostSequence uint64) error
 	if err != nil {
 		return err
 	}
-	r.summary.Batches = append(r.summary.Batches, DemoBatch{BatchNo: batchNo, FirstSequence: batch.FirstSequence, LastSequence: batch.LastSequence, Records: batch.EntryCount, CloseReason: batch.CloseReason, WitnessReceipt: fmt.Sprintf("local witness receipt %s", hex.EncodeToString(receipt.Digest[:])), Anchor: anchor})
+	r.summary.Batches = append(r.summary.Batches, DemoBatch{BatchNo: batchNo, FirstSequence: batch.FirstSequence, LastSequence: batch.LastSequence, Records: batch.EntryCount, CloseReason: batch.CloseReason, MerkleRoot: hex.EncodeToString(batch.Root[:]), WitnessReceipt: fmt.Sprintf("local witness receipt %s", hex.EncodeToString(receipt.Digest[:])), Anchor: anchor})
 	r.summary.Records++
 	body, err := json.MarshalIndent(r.summary, "", "  ")
 	if err != nil {
@@ -521,7 +657,13 @@ func (d *Demo) Close() {
 		d.run = nil
 	}
 }
-func (r *demoRun) close() { _ = r.store.Close(); _ = r.witness.Close(); r.runner.Stop() }
+func (r *demoRun) close() {
+	if r.ownsStore {
+		_ = r.store.Close()
+	}
+	_ = r.witness.Close()
+	r.runner.Stop()
+}
 
 func (r *demoRun) verify(ctx context.Context) (DemoVerification, error) {
 	result := DemoVerification{Mode: "SIMULATED", Content: "UNKNOWN", Witness: "first-write originals", Anchor: "local registry readback", Coverage: "incomplete", Issues: []VerificationIssue{}}
@@ -542,7 +684,16 @@ func (r *demoRun) verify(ctx context.Context) (DemoVerification, error) {
 		result.Issues = append(result.Issues, VerificationIssue{Reason: "local registry unavailable: " + err.Error()})
 		return result, nil
 	}
+	tx, err := r.store.DB().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		result.Issues = append(result.Issues, VerificationIssue{Reason: "collector snapshot unavailable: " + err.Error()})
+		return result, nil
+	}
+	defer tx.Rollback()
 	result.BatchesChecked = len(manifests)
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM vault_batch_members WHERE stream_id=? AND batch_no>=?`, r.streamID, len(manifests)).Scan(&result.PendingRecords); err != nil {
+		result.Issues = append(result.Issues, VerificationIssue{Reason: "pending accepted-record inventory unavailable: " + err.Error()})
+	}
 	inventoryComplete := len(manifests) == len(history)
 	if !inventoryComplete {
 		result.Issues = append(result.Issues, VerificationIssue{Reason: fmt.Sprintf("registry/witness batch inventory mismatch (%d registry, %d witness)", len(history), len(manifests))})
@@ -573,6 +724,9 @@ func (r *demoRun) verify(ctx context.Context) (DemoVerification, error) {
 	}
 	if len(manifests) == 0 || len(history) == 0 {
 		result.Issues = append(result.Issues, VerificationIssue{Reason: "witness or registry inventory is empty"})
+		if result.PendingRecords > 0 {
+			result.Content = "INCOMPLETE"
+		}
 		return result, nil
 	}
 	streamBytes, e := hex.DecodeString(r.streamID)
@@ -581,13 +735,7 @@ func (r *demoRun) verify(ctx context.Context) (DemoVerification, error) {
 	}
 	var stream integrity.Digest
 	copy(stream[:], streamBytes)
-	tx, err := r.store.DB().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		result.Issues = append(result.Issues, VerificationIssue{Reason: "collector snapshot unavailable: " + err.Error()})
-		return result, nil
-	}
-	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT m.accept_seq,m.accepted_at_ns,m.batch_no,m.raw_id,r.raw_id,r.raw_sha256,r.received_at,r.transport,r.source_ip,r.source_port,r.metadata_json,r.payload FROM vault_batch_members m LEFT JOIN raw_events r ON r.raw_id=m.raw_id WHERE m.stream_id=? ORDER BY m.accept_seq`, r.streamID)
+	rows, err := tx.QueryContext(ctx, `SELECT m.accept_seq,m.accepted_at_ns,m.batch_no,m.raw_id,r.raw_id,r.raw_sha256,r.received_at,r.transport,r.source_ip,r.source_port,r.metadata_json,r.payload FROM vault_batch_members m LEFT JOIN raw_events r ON r.raw_id=m.raw_id WHERE m.stream_id=? AND m.batch_no<? ORDER BY m.accept_seq`, r.streamID, len(manifests))
 	if err != nil {
 		result.Issues = append(result.Issues, VerificationIssue{Reason: "collector snapshot enumeration failed: " + err.Error()})
 		return result, nil
@@ -667,14 +815,27 @@ func (r *demoRun) verify(ctx context.Context) (DemoVerification, error) {
 	}
 	_ = orphans.Close()
 	result.Coverage = "complete"
-	result.Content = "INTACT"
-	if !inventoryComplete {
+	if !inventoryComplete || result.PendingRecords > 0 {
 		result.Coverage = "incomplete"
-		result.Content = "INCOMPLETE"
-	} else if len(result.Issues) > 0 {
+	}
+	if hasContentTamper(result.Issues) {
 		result.Content = "TAMPERED"
+	} else if result.Coverage == "incomplete" || len(result.Issues) > 0 {
+		result.Content = "INCOMPLETE"
+	} else {
+		result.Content = "INTACT"
 	}
 	return result, nil
+}
+
+func hasContentTamper(issues []VerificationIssue) bool {
+	for _, issue := range issues {
+		switch issue.Reason {
+		case "extra or orphan membership", "record moved to another batch", "accepted raw parent is missing", "protected raw metadata is invalid", "protected receive metadata is invalid", "payload or protected metadata differs from the immutable witness entry", "accepted raw parent or membership is missing", "orphan raw parent is outside the anchored sequence":
+			return true
+		}
+	}
+	return false
 }
 
 func equalBytes(a, b []byte) bool {

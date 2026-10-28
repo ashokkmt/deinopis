@@ -12,9 +12,10 @@ interface DashboardProps {
   onNavigate: (tab: string, param?: string) => void;
   stats?: SystemStats | null;
   onRefreshStats?: () => void;
+  integritySimulation?: boolean;
 }
 
-export const Dashboard: React.FC<DashboardProps> = ({ onNavigate, stats: propStats, onRefreshStats }) => {
+export const Dashboard: React.FC<DashboardProps> = ({ onNavigate, stats: propStats, onRefreshStats, integritySimulation = false }) => {
   const [internalStats, setInternalStats] = useState<SystemStats | null>(null);
   const [sources, setSources] = useState<SourceSummary[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
@@ -88,8 +89,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate, stats: propSta
   };
 
   const runIntegrityDemo = async () => {
-    setDemoBusy(true); setDemoError(''); setDemoNotice('Starting a disposable synthetic run…'); setDemoCheck(null);
-    try { const run = await apiService.startIntegrityDemo(); setDemoRun(run); setDemoNotice('Synthetic run ready. Choose Verify to check its snapshot.'); }
+    setDemoBusy(true); setDemoError(''); setDemoNotice(integritySimulation ? 'Loading the live-ingestion simulation…' : 'Starting a disposable synthetic run…'); setDemoCheck(null);
+    try { const run = await apiService.startIntegrityDemo(); setDemoRun(run); setDemoNotice(integritySimulation ? 'Live run refreshed. Verify checks the sealed batches; open records remain pending.' : 'Synthetic run ready. Choose Verify to check its snapshot.'); }
     catch (error) { setDemoError(error instanceof Error ? error.message : 'Could not start synthetic run'); setDemoNotice(''); }
     finally { setDemoBusy(false); }
   };
@@ -165,26 +166,26 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate, stats: propSta
         <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
           <div>
             <h2 id="integrity-demo-heading" className="text-sm font-mono font-bold text-[#f0f6fc] flex items-center gap-2"><ShieldCheck className="w-4 h-4 text-emerald-400" /> Simulated Integrity Demo</h2>
-            <p className="text-xs text-[#8b949e] mt-1 max-w-3xl">Uses 13 deterministic synthetic logs, an isolated collector, a same-host witness simulation, and a disposable loopback Anvil registry. It never reads this collector’s data.</p>
+          <p className="text-xs text-[#8b949e] mt-1 max-w-3xl">{integritySimulation ? 'Send synthetic logs to this dino server over HTTP. Sealed batches are copied to a same-host witness and committed to a disposable loopback Anvil registry. Use only the fresh demo database.' : 'Uses 13 deterministic synthetic logs, an isolated collector, a same-host witness simulation, and a disposable loopback Anvil registry. It never reads this collector’s data.'}</p>
           </div>
           <span className="text-xs font-mono rounded border border-amber-700/60 bg-amber-950/30 text-amber-300 px-2 py-1 shrink-0">SIMULATED · no public finality</span>
         </div>
         <div className="flex flex-wrap gap-2">
-          <button type="button" onClick={runIntegrityDemo} disabled={demoBusy} className="inline-flex items-center gap-2 rounded bg-[#238636] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><Play className="w-3.5 h-3.5" />Start synthetic run</button>
-          <button type="button" onClick={verifyIntegrityDemo} disabled={demoBusy || !demoRun} className="inline-flex items-center gap-2 rounded bg-[#1f6feb] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><ShieldCheck className="w-3.5 h-3.5" />Verify</button>
+          <button type="button" onClick={runIntegrityDemo} disabled={demoBusy} className="inline-flex items-center gap-2 rounded bg-[#238636] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><Play className="w-3.5 h-3.5" />{integritySimulation ? 'Load / refresh live run' : 'Start synthetic run'}</button>
+          <button type="button" onClick={verifyIntegrityDemo} disabled={demoBusy || !demoRun} className="inline-flex items-center gap-2 rounded bg-[#1f6feb] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><ShieldCheck className="w-3.5 h-3.5" />{integritySimulation ? 'Verify sealed records' : 'Verify'}</button>
           <button type="button" onClick={exportIntegrityDemo} disabled={demoBusy || !demoCheck} className="inline-flex items-center gap-2 rounded bg-[#30363d] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><Download className="w-3.5 h-3.5" />Export evidence</button>
-          <button type="button" onClick={tamperIntegrityDemo} disabled={demoBusy || !demoRun} className="inline-flex items-center gap-2 rounded bg-[#6e3a21] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><Trash2 className="w-3.5 h-3.5" />Delete one synthetic record</button>
-          <button type="button" onClick={tamperIntegrityDemoTail} disabled={demoBusy || !demoRun} className="inline-flex items-center gap-2 rounded bg-[#6e3a21] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><Trash2 className="w-3.5 h-3.5" />Delete synthetic tail batch</button>
+          {!integritySimulation && <button type="button" onClick={tamperIntegrityDemo} disabled={demoBusy || !demoRun} className="inline-flex items-center gap-2 rounded bg-[#6e3a21] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><Trash2 className="w-3.5 h-3.5" />Delete one synthetic record</button>}
+          {!integritySimulation && <button type="button" onClick={tamperIntegrityDemoTail} disabled={demoBusy || !demoRun} className="inline-flex items-center gap-2 rounded bg-[#6e3a21] disabled:opacity-50 px-3 py-2 text-xs font-medium text-white"><Trash2 className="w-3.5 h-3.5" />Delete synthetic tail batch</button>}
         </div>
         <p role="status" aria-live="polite" className="text-xs text-[#8b949e]">{demoNotice}</p>
         {demoError && <p role="alert" className="text-xs text-red-400">{demoError}</p>}
         {demoRun && <div className="text-xs font-mono text-[#8b949e] space-y-1">
-          <p>Run {demoRun.run_id} · seed {demoRun.seed} · {demoRun.records} records · chain {demoRun.chain_id} · local registry {demoRun.registry}</p>
-          <p>{demoRun.batches.map((batch) => `batch ${batch.batch_no}: seq ${batch.first_sequence}–${batch.last_sequence}, ${batch.close_reason} flush, local block ${batch.anchor.local_block}`).join(' · ')}</p>
+          <p>Run {demoRun.run_id} · {demoRun.input_mode === 'LIVE_INGESTION' ? 'HTTP-ingested' : `seed ${demoRun.seed}`} · {demoRun.records} sealed records · chain {demoRun.chain_id} · local registry {demoRun.registry}</p>
+          <p>{demoRun.batches.map((batch) => `batch ${batch.batch_no}: seq ${batch.first_sequence}–${batch.last_sequence}, ${batch.close_reason} flush, Merkle root ${batch.merkle_root.slice(0, 12)}…, local block ${batch.anchor.local_block}`).join(' · ')}</p>
         </div>}
         {demoCheck && <div className="border-t border-[#30363d] pt-3 space-y-2">
           <p className={`text-sm font-mono font-semibold ${demoCheck.content === 'INTACT' ? 'text-emerald-400' : demoCheck.content === 'TAMPERED' ? 'text-red-400' : 'text-amber-300'}`}>Content: {demoCheck.content} · coverage: {demoCheck.coverage}</p>
-          <p className="text-xs text-[#8b949e]">{demoCheck.records_checked} records checked · {demoCheck.batches_checked} witness batches · witness: {demoCheck.witness} · anchor: {demoCheck.anchor} (local readback only)</p>
+          <p className="text-xs text-[#8b949e]">{demoCheck.records_checked} records checked · {demoCheck.batches_checked} witness batches · {demoCheck.pending_records} records pending batch closure · witness: {demoCheck.witness} · anchor: {demoCheck.anchor} (local readback only)</p>
           <p className="text-xs text-[#8b949e]">Checked {new Date(demoCheck.checked_at_utc).toLocaleString()} · {demoCheck.observation_count} persisted checks{demoCheck.first_adverse_at_utc ? ` · first adverse observation ${new Date(demoCheck.first_adverse_at_utc).toLocaleString()} (retained after recovery)` : ' · no adverse observation recorded'}</p>
           {demoCheck.issues.length > 0 && <ul className="list-disc pl-5 text-xs text-red-300 space-y-1">{demoCheck.issues.map((issue, index) => <li key={`${issue.sequence ?? issue.raw_id ?? 'issue'}-${index}`}>{issue.sequence ? `Sequence ${issue.sequence}, batch ${issue.batch_no}: ` : ''}{issue.reason}</li>)}</ul>}
         </div>}

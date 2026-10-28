@@ -9,13 +9,14 @@ let adminToken = '';
 
 export interface IntegrityDemoRun {
   mode: string;
+  input_mode: string;
   run_id: string;
   stream_id: string;
   generator_version: string;
   seed: number;
   records: number;
   fixture_digests: Record<string, string>;
-  batches: Array<{ batch_no: number; first_sequence: number; last_sequence: number; records: number; close_reason: string; witness_receipt: string; anchor: { transaction_hash: string; local_block: number; commitment: string } }>;
+  batches: Array<{ batch_no: number; first_sequence: number; last_sequence: number; records: number; close_reason: string; merkle_root: string; witness_receipt: string; anchor: { transaction_hash: string; local_block: number; commitment: string } }>;
   chain_id: string;
   registry: string;
   registry_code_hash: string;
@@ -32,6 +33,7 @@ export interface IntegrityDemoCheck {
   coverage: string;
   records_checked: number;
   batches_checked: number;
+  pending_records: number;
   issues: Array<{ sequence?: number; batch_no?: number; raw_id?: string; reason: string }>;
 }
 
